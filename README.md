@@ -83,8 +83,8 @@ For production use, pair Echocorn with standard hardening measures (firewall rul
 
 Examples of running Echocorn and request logs:
 
-<img width="49.9%" src="https://raw.githubusercontent.com/mishakorzik/echocorn/refs/heads/main/screenshot_1.jpg"/>
-<img width="49.9%" src="https://raw.githubusercontent.com/mishakorzik/echocorn/refs/heads/main/screenshot_2.jpg"/>
+<img width="48.9%" src="https://raw.githubusercontent.com/mishakorzik/echocorn/refs/heads/main/screenshot_1.jpg"/>
+<img width="48.9%" src="https://raw.githubusercontent.com/mishakorzik/echocorn/refs/heads/main/screenshot_2.jpg"/>
 
 ---
 
