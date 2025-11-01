@@ -59,9 +59,11 @@ Echocorn exposes CLI flags for common server settings such as:
 * `--app` — module:callable path to your ASGI application
 * `--host` / `--port` — where the server listens
 * `--workers` — number of worker processes
-* `--ssl-certfile`, `--ssl-keyfile` — TLS/SSL files for secure connections
+* `--certfile`, `--keyfile` — TLS/SSL files for secure connections
 * `--compression` — toggle or tune response compression
-* `--http2` — enable/disable HTTP/2 (enabled by default where supported)
+* `--safe-headers` — enable security headers
+* `--domain` — allows requests only if host in headers matches
+* `--about` — show about the server
 
 Run `echocorn --help` to see the full set of parameters and defaults.
 
