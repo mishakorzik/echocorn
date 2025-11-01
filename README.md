@@ -8,7 +8,7 @@
 
 * High-performance ASGI server optimized for low-latency workloads
 * Native HTTP/1.1 implementation plus built-in HTTP/2 support via `h2`
-* Transparent response compression (gzip/deflate/br) to reduce bandwidth usage
+* Transparent response compression (gzip/deflate) to reduce bandwidth usage
 * Enhanced HTTP header security (CSP, HSTS, X-Frame-Options, etc.) out of the box
 * Minimal dependencies and small memory footprint
 * Simple command-line interface for quick deployment
