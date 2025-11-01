@@ -43,11 +43,11 @@ echocorn --help
 
 ## Example usage
 
-Use Echocorn to serve a FastAPI, Starlette, or any ASGI app. Example with `uvicorn`-style callable:
+Use Echocorn to serve a FastAPI, Starlette, or any ASGI app.
 
 ```bash
 # Serve app.app (where `app` is an ASGI application instance)
-echocorn --app app:app --host 0.0.0.0 --port 443 --workers 4 --ssl-keyfile key.pem --ssl-certfile cert.pem
+echocorn --app app:app --host 0.0.0.0 --port 443 --workers 2 --safe-headers --keyfile key.pem --certfile cert.pem
 ```
 
 ---
