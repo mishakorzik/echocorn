@@ -2,6 +2,8 @@
 
 **Echocorn** is an exceptionally fast, lightweight ASGI server with a custom HTTP/1.1 implementation and first-class HTTP/2 support (powered by the `h2` library). Designed for modern web applications, Echocorn combines high throughput with small resource overhead and includes built-in response compression and hardened HTTP header security.
 
+**Sometimes unstable. Do not use in production**
+
 ---
 
 ## Key features
