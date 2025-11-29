@@ -102,7 +102,6 @@ If you find Echocorn useful and want to support development, you can donate here
 
 ## Community & support
 
-* Telegram: [https://t.me/ubp2q](https://t.me/ubp2q)
 * Discord: [https://discord.gg/xwpMuMYW57](https://discord.gg/xwpMuMYW57)
 
 If you find a bug or have questions, open an issue or reach out on Discord.
