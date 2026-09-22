@@ -1,0 +1,116 @@
+# Echocorn configuration.
+# Start the server with: echocorn --config echocorn.toml
+# Every setting lives in this file; the command line only takes --config.
+# Unknown keys, wrong types and out of range values are refused at startup.
+
+# What to serve. An ASGI application is named as "module:attribute" and its
+# module is imported from the directory this file is in.
+#
+# A server that is already listening on a local address is named as "host:port",
+# for example app = "127.0.0.1:5000" or app = "10.0.0.16:8080": Echocorn then
+# becomes a reverse proxy in front of it (TLS, HTTP/2, limits and the redirect
+# all stay in front, and WebSocket sessions are tunnelled through). Only a
+# loopback, private or link-local address is accepted, so a configuration file
+# can never turn the server into an open proxy.
+app = "app:app"
+
+
+[server]
+# Where to listen. An empty host binds every interface.
+host = "0.0.0.0"
+port = 443
+
+# Worker processes sharing the port. This process is worker #1 and the other
+# workers - 1 are started as child processes.
+workers = 2
+
+# One timeout guards a request in every phase: the TLS handshake, receiving the
+# head and body (absolute, so trickling does not extend it), then producing the
+# response (restarted on every write). A connection that runs out of time is
+# reset. 0 disables the timeout.
+request_timeout = 10.0
+
+# Close keep-alive connections that stay idle for this long.
+keep_alive_timeout = 5.0
+
+# How long an in-flight request may take while the server shuts down.
+graceful_timeout = 10.0
+
+# Limits. Sizes are bytes, 0 disables the limit.
+max_connections = 0
+backlog = 2048
+max_request_size = 0
+max_header_size = 16384
+max_header_count = 128
+
+# Answer 421 when Host/:authority does not match this name. Empty disables it.
+bind_domain = ""
+
+# Compress responses with gzip/deflate when the client asks for it.
+compression = false
+
+# Add HSTS, X-Frame-Options and the other hardening headers.
+safe_headers = false
+
+
+[http1]
+# Serve HTTP/1.1 (RFC 9110, RFC 9112).
+enabled = true
+
+
+[http2]
+# Serve HTTP/2 (RFC 9113) over TLS with ALPN, or "h2c" with prior knowledge.
+# Nothing is advertised through ALPN while this is false.
+enabled = true
+
+# HTTP/2 settings advertised to clients.
+max_concurrent_streams = 100
+initial_window_size = 65535
+max_frame_size = 16384
+max_header_list_size = 16384
+
+
+[websocket]
+# Accept WebSocket upgrades (RFC 6455) over HTTP/1.1. wss:// is served
+# whenever TLS is configured.
+enabled = true
+
+# Biggest message accepted, counting all of its fragments.
+max_message_size = 4194304
+
+
+[redirect]
+# Answer plaintext requests with a permanent redirect to the TLS origin, keeping
+# the path and query string. Needs tls.certfile/keyfile above and at least two
+# workers: one worker of its own does nothing but the redirect, the others serve
+# the application. A single worker skips the redirect and serves the site.
+enabled = false
+
+# Address of the redirect listener. Empty follows [server] host.
+host = ""
+
+# Port to listen on for the redirect, usually 80. 0 lets the OS choose one.
+port = 80
+
+# Redirect status: 308 (default), 301, 302 or 307.
+status = 308
+
+
+[logging]
+# One of CRIT, ERROR, WARN, INFO or DEBUG. Startup and shutdown lines are
+# always shown, whatever the level is.
+level = "INFO"
+
+# One line per request and per WebSocket session.
+access = true
+
+# Colour the timestamp and the level with ANSI escapes (for a terminal).
+color = false
+
+
+[tls]
+# Fill in both files to serve HTTPS with ALPN (h2 and http/1.1). Relative
+# paths are read from the directory of this file. On Windows write a path with
+# forward slashes, or inside single quotes to keep the backslashes.
+certfile = ""
+keyfile = ""
