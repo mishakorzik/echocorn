@@ -3,8 +3,7 @@
 **Echocorn** is a fast, lightweight ASGI server with a hand written HTTP/1.1
 implementation and first class HTTP/2 support built on [`h2`](https://pypi.org/project/h2/).
 It targets modern async applications (FastAPI, Starlette, Quart, Django, ...) and
-keeps a
-small dependency footprint while implementing the protocol details that matter in
+keeps a small dependency footprint while implementing the protocol details that matter in
 production: RFC compliant framing, correct HTTP/2 flow control, backpressure,
 timeouts, TLS with ALPN and graceful shutdown.
 
@@ -238,7 +237,7 @@ from echocorn import ASGIServer, ServerConfig
 config = ServerConfig(host="127.0.0.1", port=8080, compression=True)
 server = ASGIServer(app, config)
 
-asyncio.run(server.serve())   # or server.run() to block
+asyncio.run(server.serve())  # or server.run() to block
 ```
 
 An existing configuration file can be reused from Python, with the same
@@ -307,7 +306,7 @@ it by address instead of by module:
 
 ```toml
 # echocorn.toml
-app = "127.0.0.1:5000"    # proxy to a server that already listens here
+app = "127.0.0.1:5000"  # proxy to a server that already listens here
 
 [server]
 port = 443
