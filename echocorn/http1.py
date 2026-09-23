@@ -19,12 +19,13 @@ import asyncio
 import logging
 import re
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from collections.abc import Callable
 from urllib.parse import urlsplit
 
 from . import utils
 from . import websocket as ws
 from .config import ServerConfig
+from .ratelimit import RateLimiter, client_key, retry_after_seconds
 from .utils import ASGIRequest, BodyAbandoned, Compressor, Headers
 
 __all__ = ["CONNECTION_PREFACE", "HTTP11Handler", "ChunkedDecoder", "parse_request_head"]
@@ -36,6 +37,7 @@ ALLOWED_METHODS = utils.ALLOWED_METHODS
 
 _TOKEN_RE = re.compile(rb"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _REQUEST_LINE_RE = re.compile(rb"^([!#$%&'*+\-.^_`|~0-9A-Za-z]+) ([^ ]+) HTTP/(1\.[01])$")
+
 # The method alone, used to keep error responses HEAD safe.
 _METHOD_RE = re.compile(rb"^([A-Za-z]+)[ \t]")
 
@@ -43,26 +45,41 @@ _METHOD_RE = re.compile(rb"^([A-Za-z]+)[ \t]")
 # C0 control byte except horizontal tab. Rejecting them removes a whole class
 # of log and header injection tricks.
 _ILLEGAL_VALUE_RE = re.compile(rb"[\x00-\x08\x0a-\x1f\x7f]")
+
 # A request target is a sequence of visible ASCII characters only.
 _ILLEGAL_TARGET_RE = re.compile(rb"[\x00-\x20\x7f]")
 
+# Framing numbers are digits and nothing else: RFC 9110 section 8.6 defines
+# ``Content-Length`` as 1*DIGIT and RFC 9112 section 7.1 a chunk size as
+# 1*HEXDIG. ``int()`` on its own is far more forgiving than the grammar - it
+# accepts ``+5`` and even ``5_0`` - and every value it reads differently to a
+# peer in front of us is a disagreement about where the body ends.
+_CONTENT_LENGTH_RE = re.compile(rb"^[0-9]+$")
+_CHUNK_SIZE_RE = re.compile(rb"^[0-9A-Fa-f]+$")
+
 #: Pause reading from the socket above this many buffered bytes.
-READ_HIGH_WATERMARK = 256 * 1024
+READ_HIGH_WATERMARK = 262144
 #: Resume reading once the buffer drops below this.
-READ_LOW_WATERMARK = 64 * 1024
+READ_LOW_WATERMARK = 65536
 
 #: Maximum number of unread body bytes we are willing to discard after the app
 #: responded early. Beyond this the connection is closed instead of drained.
-MAX_DRAIN_BYTES = 64 * 1024
+MAX_DRAIN_BYTES = 65536
 
 MAX_CHUNK_LINE = 1024
 MAX_TARGET_LENGTH = utils.MAX_TARGET_LENGTH
+
+#: Trailer fields kept from a decoded body.  They belong to the message and are
+#: handed to the caller that wants them (the proxy relays them); a request body
+#: simply ignores them.  The cap is what keeps a peer from filling memory with
+#: trailer fields nobody reads.
+MAX_TRAILER_FIELDS = 64
 
 
 class _ProtocolError(Exception):
     """A request could not be parsed; carries the status code to respond with."""
 
-    def __init__(self, status: int, message: str = "", allow: Optional[str] = None):
+    def __init__(self, status: int, message: str = "", allow: str | None = None):
         super().__init__(message or str(status))
         self.status = status
         self.message = message
@@ -87,7 +104,7 @@ class _ParsedHead:
         self.target = b"/"
         self.version = "1.1"
         self.headers: Headers = []
-        self.content_length: Optional[int] = None
+        self.content_length: int | None = None
         self.chunked = False
         self.keep_alive = True
         self.expect_continue = False
@@ -97,16 +114,19 @@ class _ParsedHead:
 class ChunkedDecoder:
     """Incremental ``chunked`` transfer coding decoder (RFC 9112 section 7.1)."""
 
-    __slots__ = ("state", "remaining", "done")
+    __slots__ = ("state", "remaining", "done", "trailers")
 
     def __init__(self) -> None:
         self.state = "size"
         self.remaining = 0
         self.done = False
+        #: Fields of the trailer section the body ended with (RFC 9110 section
+        #: 6.5), lower cased, at most :data:`MAX_TRAILER_FIELDS` of them.
+        self.trailers: list[tuple[bytes, bytes]] = []
 
-    def feed(self, buffer: bytearray, max_size: int) -> List[bytes]:
+    def feed(self, buffer: bytearray, max_size: int) -> list[bytes]:
         """Consume ``buffer`` in place and return the decoded body chunks."""
-        chunks: List[bytes] = []
+        chunks: list[bytes] = []
         while True:
             if self.state == "size":
                 index = buffer.find(b"\r\n")
@@ -114,17 +134,14 @@ class ChunkedDecoder:
                     if len(buffer) > MAX_CHUNK_LINE:
                         raise _ProtocolError(400, "chunk size line too long")
                     return chunks
-                line = bytes(buffer[:index])
+                line = buffer[:index]
                 del buffer[: index + 2]
                 line = line.split(b";", 1)[0].strip()
                 if not line:
                     raise _ProtocolError(400, "empty chunk size")
-                try:
-                    size = int(line, 16)
-                except ValueError:
-                    raise _ProtocolError(400, "invalid chunk size") from None
-                if size < 0:
+                if _CHUNK_SIZE_RE.match(line) is None:
                     raise _ProtocolError(400, "invalid chunk size")
+                size = int(line, 16)
                 if max_size and size > max_size:
                     raise _ProtocolError(413, "payload too large")
                 if size == 0:
@@ -153,22 +170,31 @@ class ChunkedDecoder:
                         if len(buffer) > MAX_CHUNK_LINE:
                             raise _ProtocolError(400, "trailer line too long")
                         return chunks
-                    line = bytes(buffer[:index])
+                    line = buffer[:index]
                     del buffer[: index + 2]
                     if not line:
                         self.done = True
                         return chunks
                     if line[0] in (0x20, 0x09) or b":" not in line:
                         raise _ProtocolError(400, "malformed trailer field")
+                    if len(self.trailers) < MAX_TRAILER_FIELDS:
+                        name, _, value = line.partition(b":")
+                        self.trailers.append((bytes(name.strip().lower()), bytes(value.strip())))
 
 
-def parse_request_head(buffer: bytearray, config: ServerConfig) -> Optional[_ParsedHead]:
+def parse_request_head(buffer: bytearray, config: ServerConfig) -> _ParsedHead | None:
     """
     Parse a complete request head out of ``buffer``.
 
     Returns ``None`` when more data is required, otherwise consumes the head
     and returns the parsed result. Raises :class:`_ProtocolError` for anything
     that must be rejected.
+
+    The head is read straight out of ``buffer``, so the header names and values
+    it hands out are slices of that ``bytearray`` - no copy is made for a
+    request that is going to be parsed once. They compare like ``bytes`` but a
+    ``bytearray`` is unhashable, so they must be matched with ``in`` on a tuple
+    (or with :func:`echocorn.utils.has_header`) and never looked up in a set.
     """
     index = buffer.find(b"\r\n\r\n")
     if index == -1:
@@ -201,10 +227,10 @@ def parse_request_head(buffer: bytearray, config: ServerConfig) -> Optional[_Par
     # next request on the connection could be meant for another host.
     authority_known = bool(target.startswith((b"http://", b"https://")))
 
-    content_lengths: List[int] = []
-    transfer_encodings: List[bytes] = []
-    connection_tokens: List[bytes] = []
-    host_values: List[bytes] = []
+    content_lengths: list[int] = []
+    transfer_encodings: list[bytes] = []
+    connection_tokens: list[bytes] = []
+    host_values: list[bytes] = []
     for header_count, line in enumerate(lines[1:], start=1):
         if not line:
             raise _ProtocolError(400, "empty header field")
@@ -222,10 +248,9 @@ def parse_request_head(buffer: bytearray, config: ServerConfig) -> Optional[_Par
         lowered = name.lower()
         head.headers.append((lowered, value))
         if lowered == b"content-length":
-            try:
-                content_lengths.append(int(value))
-            except ValueError:
-                raise _ProtocolError(400, "invalid content-length") from None
+            if _CONTENT_LENGTH_RE.match(value) is None:
+                raise _ProtocolError(400, "invalid content-length")
+            content_lengths.append(int(value))
         elif lowered == b"transfer-encoding":
             transfer_encodings.extend(token.strip().lower() for token in value.split(b",") if token.strip())
         elif lowered == b"connection":
@@ -241,10 +266,45 @@ def parse_request_head(buffer: bytearray, config: ServerConfig) -> Optional[_Par
     if len(host_values) > 1:
         raise _ProtocolError(400, "duplicate host header")
     if host_values:
+        if not utils.valid_authority(host_values[0]):
+            # RFC 9112 section 3.2: a Host field value that is not an authority
+            # must be refused, not passed on to be routed (or cached, or logged)
+            # by something that reads it differently.
+            raise _ProtocolError(400, "invalid host header")
         head.host = host_values[0]
         authority_known = True
     elif head.version == "1.1":
         raise _ProtocolError(400, "missing host header")
+
+    if target.startswith((b"http://", b"https://")):
+        # RFC 9112 section 3.2.2: with an absolute-form request-target an origin
+        # server MUST ignore the received Host field and use the authority of
+        # the target instead.  Following that rule keeps this server and the hop
+        # in front of it - which may well have routed on the target - agreeing
+        # about the site the request is for, and the application must see the
+        # same authority the routing used.  An absolute target without an
+        # authority (``http:///path``) says nothing, so the Host field stands.
+        authority = _target_authority(target)
+        if authority is None:
+            raise _ProtocolError(400, "malformed authority in request target")
+        if authority:
+            if not utils.valid_authority(authority):
+                raise _ProtocolError(400, "invalid authority in request target")
+            head.host = authority
+            authority_known = True
+            rewritten: Headers = []
+            seen = False
+            for name, value in head.headers:
+                if name == b"host":
+                    if seen:
+                        continue
+                    rewritten.append((b"host", authority))
+                    seen = True
+                else:
+                    rewritten.append((name, value))
+            if not seen:
+                rewritten.append((b"host", authority))
+            head.headers = rewritten
 
     if transfer_encodings:
         if head.version == "1.0":
@@ -292,7 +352,37 @@ def _peek_method(buffer: bytes) -> bytes:
     return match.group(1).upper() if match else b""
 
 
-def _split_target(target: bytes) -> Tuple[bytes, bytes]:
+def _peek_target(buffer: bytes) -> str:
+    """Best effort request target for the log of a rejected head."""
+    end = buffer.find(b"\r\n")
+    line = buffer if end == -1 else buffer[:end]
+    parts = bytes(line).split(b" ")
+    if len(parts) < 2:
+        return ""
+    return parts[1].decode("latin-1", "replace")
+
+
+def _target_authority(target: bytes) -> bytes | None:
+    """
+    Return the authority (``host[:port]``) of an absolute-form request target.
+
+    The authority is returned exactly as written, userinfo included: RFC 9112
+    section 3.2.2 makes a target that carries userinfo invalid, so the caller
+    refuses it through :func:`echocorn.utils.valid_authority` rather than
+    quietly dropping the credentials and routing the request anyway.
+
+    ``None`` means the authority cannot even be read - ``http://[::1/x`` and
+    friends make the standard parser raise - which is a request to refuse, not
+    one to fall back to the ``Host`` field for.  That raise used to escape the
+    parser and end the connection with no answer at all.
+    """
+    try:
+        return urlsplit(target.decode("latin-1")).netloc.encode("latin-1")
+    except ValueError:
+        return None
+
+
+def _split_target(target: bytes) -> tuple[bytes, bytes]:
     """Return ``(raw_path_without_query, query_string)`` for a request target."""
     if target == b"*":
         return b"*", b""
@@ -300,7 +390,13 @@ def _split_target(target: bytes) -> Tuple[bytes, bytes]:
         path, _, query = target.partition(b"?")
         return path, query
     if target.startswith((b"http://", b"https://")):
-        split = urlsplit(target.decode("latin-1"))
+        try:
+            split = urlsplit(target.decode("latin-1"))
+        except ValueError:
+            # The same bracketed authority the parser already refused; reaching
+            # here means a form it let through, so refuse it rather than let a
+            # parse error end the connection.
+            raise _ProtocolError(400, "malformed authority in request target") from None
         path = (split.path or "/").encode("latin-1")
         query = (split.query or "").encode("latin-1")
         return path, query
@@ -310,17 +406,7 @@ def _split_target(target: bytes) -> Tuple[bytes, bytes]:
 class HTTP11Handler:
     """Protocol handler for a single plaintext or TLS HTTP/1.1 connection."""
 
-    def __init__(
-        self,
-        app: Callable,
-        config: ServerConfig,
-        transport: asyncio.Transport,
-        peername: Any,
-        server_addr: Any,
-        ssl_object: Any,
-        logger: logging.Logger,
-        on_close: Optional[Callable[[], None]] = None,
-    ) -> None:
+    def __init__(self, app: Callable, config: ServerConfig, transport: asyncio.Transport, peername: object, server_addr: object, ssl_object: object, logger: logging.Logger, on_close: Callable[[], None] | None = None, rate_limiter: RateLimiter | None = None) -> None:
         self.app = app
         self.config = config
         self.transport = transport
@@ -330,12 +416,13 @@ class HTTP11Handler:
         self.logger = logger
         self.access_logger = logging.getLogger("echocorn.access")
         self._on_close = on_close
+        self.rate_limiter = rate_limiter
 
         self._buffer = bytearray()
         self._data_event = asyncio.Event()
-        self._reader_task: Optional[asyncio.Task] = None
-        self._request: Optional[ASGIRequest] = None
-        self._writer_task: Optional[asyncio.Task] = None
+        self._reader_task: asyncio.Task | None = None
+        self._request: ASGIRequest | None = None
+        self._writer_task: asyncio.Task | None = None
         self._state = "idle"
         self._closed = False
         self._read_paused = False
@@ -343,20 +430,20 @@ class HTTP11Handler:
         self._resume_event = asyncio.Event()
         self._resume_event.set()
         self._body_remaining = 0
-        self._chunked_decoder: Optional[ChunkedDecoder] = None
+        self._chunked_decoder: ChunkedDecoder | None = None
         self._body_bytes = 0
         self._expect_continue = False
         self._continue_sent = False
         self._requests_served = 0
-        self._deadline: Optional[float] = None
-        self._watchdog_task: Optional[asyncio.Task] = None
-        self._websocket: Optional[ws.WebSocketSession] = None
-        self._websocket_close_task: Optional[asyncio.Task] = None
+        self._deadline: float | None = None
+        self._watchdog_task: asyncio.Task | None = None
+        self._websocket: ws.WebSocketSession | None = None
+        self._websocket_close_task: asyncio.Task | None = None
 
     # asyncio protocol callbacks.
     def connection_made(self) -> None:
         try:
-            self.transport.set_write_buffer_limits(high=256 * 1024, low=64 * 1024)
+            self.transport.set_write_buffer_limits(high=262144, low=65536)
         except (AttributeError, NotImplementedError):
             pass
         # The clock starts with the connection itself, so a peer that connects
@@ -389,7 +476,7 @@ class HTTP11Handler:
         self._write_paused = False
         self._resume_event.set()
 
-    def connection_lost(self, exc: Optional[BaseException]) -> None:
+    def connection_lost(self, exc: BaseException | None) -> None:
         self._closed = True
         if self._request is not None:
             self._request.notify_disconnect()
@@ -576,30 +663,33 @@ class HTTP11Handler:
                 exc.message,
                 allow=exc.allow,
                 method=_peek_method(self._buffer),
+                target=_peek_target(self._buffer),
             )
             return False
         if head is None:
             return False
 
+        # Each request gets a fresh window: the deadline that was armed when the
+        # connection went idle covered the wait for this head, and must not eat
+        # into the time the request itself is allowed to take.
+        self._arm_deadline()
+        target = head.target.decode("latin-1", "replace")
+
+        if self.rate_limiter is not None and not await self._allow_request(head.method, target):
+            return False
+
         try:
             raw_path, query = _split_target(head.target)
         except _ProtocolError as exc:
-            await self._send_error(exc.status, exc.message, method=head.method)
+            await self._send_error(exc.status, exc.message, method=head.method, target=target)
             return False
 
         if self.config.bind_domain:
-            if utils.authority_host(head.host) != utils.authority_host(
-                self.config.bind_domain.encode("latin-1", "replace")
-            ):
-                await self._send_error(421, "misdirected request", method=head.method)
+            if utils.authority_host(head.host) != utils.authority_host(self.config.bind_domain.encode("latin-1", "replace")):
+                await self._send_error(421, "misdirected request", method=head.method, target=target)
                 return False
 
-        if (
-            self.config.websockets
-            and head.version == "1.1"
-            and head.method == b"GET"
-            and ws.wants_websocket(head.headers)
-        ):
+        if (self.config.websockets and head.version == "1.1" and head.method == b"GET" and ws.wants_websocket(head.headers)):
             await self._serve_websocket(head, raw_path, query)
             return False
 
@@ -628,6 +718,27 @@ class HTTP11Handler:
         request.app_task = asyncio.ensure_future(request.run_app(self.app))
         self._writer_task = asyncio.ensure_future(self._write_response(request))
         return True
+
+    async def _allow_request(self, method: bytes, target: str = "") -> bool:
+        """Count one request; answer ``429`` when the client is over its limit."""
+        assert self.rate_limiter is not None
+        client = client_key(self.peername)
+        wait = self.rate_limiter.check(client)
+        if wait is None:
+            return True
+        seconds = retry_after_seconds(wait)
+        # The connection is closed with the refusal: the body of a request that
+        # was never dispatched has not been read, and leaving it on the wire
+        # would be read as the next request on a reused connection. The line is
+        # logged as a warning, naming the address that was limited.
+        await self._send_error(
+            429,
+            "too many requests",
+            extra=[(b"retry-after", str(seconds).encode("ascii"))],
+            method=method,
+            target=target,
+        )
+        return False
 
     def _send_continue(self) -> None:
         if self._continue_sent or self._closed:
@@ -672,14 +783,11 @@ class HTTP11Handler:
         try:
             while self._buffer and self._body_remaining > 0:
                 take = min(len(self._buffer), self._body_remaining)
-                chunk = bytes(self._buffer[:take])
+                chunk = self._buffer[:take]
                 del self._buffer[:take]
                 self._body_remaining -= take
                 self._body_bytes += take
-                if (
-                    self.config.max_request_size
-                    and self._body_bytes > self.config.max_request_size
-                ):
+                if (self.config.max_request_size and self._body_bytes > self.config.max_request_size):
                     raise _ProtocolError(413, "payload too large")
                 await self._emit_body(chunk)
                 progressed = True
@@ -690,7 +798,7 @@ class HTTP11Handler:
             self._abandon_body()
             return True
         except _ProtocolError as exc:
-            self._request = None
+            self._fail_request()
             await self._send_error(exc.status, exc.message)
             return False
         return progressed
@@ -721,9 +829,27 @@ class HTTP11Handler:
             self._abandon_body()
             return True
         except _ProtocolError as exc:
-            self._request = None
+            self._fail_request()
             await self._send_error(exc.status, exc.message)
             return False
+
+    def _fail_request(self) -> None:
+        """
+        Stop a request whose body could not be accepted.
+
+        The application may already be waiting for input - it is often the case
+        that it answered early and the framing error only turns up afterwards -
+        so it is woken with ``http.disconnect``.  The reference is deliberately
+        kept in place: dropping it here would leave the application task with
+        nothing that can ever cancel it, so it would sit on ``receive()`` for the
+        lifetime of the process (and the connection teardown would not find it
+        either).
+        """
+        request = self._request
+        if request is None:
+            return
+        request.keep_alive = False
+        request.notify_disconnect()
 
     def _on_response_finished(self, request: ASGIRequest) -> None:
         """
@@ -847,9 +973,7 @@ class HTTP11Handler:
         if not data:
             return
         if chunked:
-            await self._write(
-                format(len(data), "x").encode("ascii") + b"\r\n" + data + b"\r\n"
-            )
+            await self._write(format(len(data), "x").encode("ascii") + b"\r\n" + data + b"\r\n")
         else:
             await self._write(data)
         request.bytes_sent += len(data)
@@ -858,7 +982,7 @@ class HTTP11Handler:
         self._arm_deadline()
 
     def _build_head(self, request: ASGIRequest, status: int, headers: Headers) -> bytes:
-        parts: List[bytes] = [
+        parts: list[bytes] = [
             b"HTTP/1.1 ",
             str(status).encode("latin-1"),
             b" ",
@@ -885,16 +1009,17 @@ class HTTP11Handler:
     async def _write_response(self, request: ASGIRequest) -> None:
         try:
             headers: Headers = []
-            compressor: Optional[Compressor] = None
+            compressor: Compressor | None = None
             chunked = False
             started = False
+            aborted = False
             trailers_expected = False
             awaiting_trailers = False
             discard_body = False
             # What the application announced, and what actually reached the
             # wire: a mismatch must close the connection, or the next response
             # on it would be read as part of this body.
-            declared_length: Optional[int] = None
+            declared_length: int | None = None
             body_bytes = 0
 
             # The single request deadline (enforced by the watchdog) covers a
@@ -908,7 +1033,7 @@ class HTTP11Handler:
                     if raw_status < 200:
                         # 1xx informational response (RFC 9110 section 15.2).
                         interim = utils.normalize_response_headers(message.get("headers"))
-                        parts: List[bytes] = [
+                        parts: list[bytes] = [
                             b"HTTP/1.1 ",
                             str(raw_status).encode("latin-1"),
                             b" ",
@@ -927,6 +1052,11 @@ class HTTP11Handler:
                     trailers_expected = bool(message.get("trailers")) and has_body
 
                     if has_body and self.config.compression:
+                        if utils.compressible_response(request.scope["method"], status, headers):
+                            # The coding of the answer was negotiated from the
+                            # request, so a shared cache has to be told about it
+                            # (RFC 9110 section 12.5.5).
+                            headers = utils.add_vary(headers)
                         encoding = utils.should_compress(
                             request.scope["method"],
                             status,
@@ -983,6 +1113,14 @@ class HTTP11Handler:
                         if not more:
                             break
                         continue
+                    if not more and message.get("aborted"):
+                        # The application gave up on an answer it had already
+                        # started (see utils.ResponseAborted). The framing is
+                        # left unterminated on purpose: a truncated body that
+                        # ends with a chunk terminator would look complete, and
+                        # a deflate tail would look like a whole stream.
+                        aborted = True
+                        break
                     if compressor is not None:
                         if body:
                             compressed = compressor.compress(body)
@@ -1019,6 +1157,13 @@ class HTTP11Handler:
                         continue
                     await self._write(payload + b"\r\n")
                     break
+
+            if aborted:
+                # Never a clean end: the connection is closed with the framing
+                # where it stopped, so the client sees the answer was cut.
+                self.logger.warning("Closing the connection on an abandoned response")
+                request.keep_alive = False
+                self._close()
 
             if declared_length is not None and body_bytes != declared_length:
                 # The application lied about the body it was going to send (or
@@ -1064,7 +1209,7 @@ class HTTP11Handler:
         await self._write(body)
         request.bytes_sent += len(body)
 
-    def _http_scope(self, head: _ParsedHead, raw_path: bytes, query: bytes) -> Dict[str, Any]:
+    def _http_scope(self, head: _ParsedHead, raw_path: bytes, query: bytes) -> dict[str, object]:
         return {
             "type": "http",
             "asgi": {"version": "3.0", "spec_version": "2.3"},
@@ -1085,7 +1230,7 @@ class HTTP11Handler:
         started = time.monotonic()
         scheme = "wss" if self.ssl_object is not None else "ws"
 
-        def report(status: int, messages: Optional[int] = None) -> None:
+        def report(status: int, messages: int | None = None) -> None:
             """Log the whole session on one line, like an HTTP request."""
             if not self.config.access_log:
                 return
@@ -1103,22 +1248,23 @@ class HTTP11Handler:
                 messages,
             )
 
+        target = head.target.decode("latin-1", "replace")
         key = utils.get_header(head.headers, b"sec-websocket-key")
         if key is None or not ws.valid_key(key.strip()):
-            await self._send_error(400, "invalid sec-websocket-key", method=head.method)
+            await self._send_error(400, "invalid sec-websocket-key", method=head.method, target=target)
             report(400)
             return
         version = utils.get_header(head.headers, b"sec-websocket-version")
         if version is None or version.strip() != b"13":
-            await self._send_error(426, "unsupported websocket version", extra=[(b"sec-websocket-version", b"13")], method=head.method)
+            await self._send_error(426, "unsupported websocket version", extra=[(b"sec-websocket-version", b"13")], method=head.method, target=target)
             report(426)
             return
         if head.chunked or head.content_length:
-            await self._send_error(400, "websocket upgrade with a request body", method=head.method)
+            await self._send_error(400, "websocket upgrade with a request body", method=head.method, target=target)
             report(400)
             return
 
-        scope: Dict[str, Any] = {
+        scope: dict[str, object] = {
             "type": "websocket",
             "asgi": {"version": "3.0", "spec_version": "2.3"},
             "http_version": head.version,
@@ -1172,8 +1318,37 @@ class HTTP11Handler:
                 report(status, session.messages if session.accepted else None)
             self._close()
 
-    async def _send_error(self, status: int, message: str = "", allow: Optional[str] = None, extra: Optional[Headers] = None, method: bytes = b"") -> None:
-        """Respond to an unparseable request and close the connection."""
+    async def _send_error(self, status: int, message: str = "", allow: str | None = None, extra: Headers | None = None, method: bytes = b"", target: str = "") -> None:
+        """
+        Respond to a request the server refuses itself, and log who sent it.
+
+        These answers never reach the application, so the operator only learns
+        about a misdirected request, a refused method, a head that was too large
+        or a rate limited client from here.
+        """
+        utils.refusal_log(
+            self.logger,
+            "h11",
+            self.peername,
+            method.decode("latin-1", "replace") or None,
+            target,
+            status,
+            message,
+        )
+        request = self._request
+        if request is not None and request.response_started:
+            # The application already put a response head on this connection, so
+            # a second one would be read as part of that body: a chunked body
+            # would suddenly contain a status line (response splitting), and a
+            # client or cache in front of the server would desynchronise.  The
+            # exchange is abandoned instead - the connection is closed with the
+            # framing exactly where it stopped, which is how a peer tells a
+            # truncated answer from a complete one.
+            self.logger.warning("Abandoning a started response after a refusal: %s", message or status)
+            request.keep_alive = False
+            request.notify_disconnect()
+            self._close()
+            return
         phrase = utils.status_phrase(status)
         lines = ["%d %s" % (status, phrase)]
         # Only a message that adds information is repeated: an error whose text
@@ -1183,7 +1358,7 @@ class HTTP11Handler:
         body = ("\n".join(lines) + "\n").encode("latin-1", "replace")
         # A HEAD response keeps the length it would have had but no body.
         send_body = utils.response_has_body(method.decode("latin-1", "replace") or "GET", status)
-        parts: List[bytes] = [
+        parts: list[bytes] = [
             b"HTTP/1.1 ",
             str(status).encode("latin-1"),
             b" ",

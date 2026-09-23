@@ -69,6 +69,30 @@ def test_location_refuses_a_target_that_is_not_a_path():
     assert build_location(CONFIG, b"*", b"example.com") is None
 
 
+@pytest.mark.parametrize(
+    "host",
+    [
+        b"example.com\nX-Injected: yes",
+        b"example.com\rX-Injected: yes",
+        b"exa\x0bmple.com",
+        b"example.com\x00",
+        b"exa mple.com",
+    ],
+)
+def test_location_refuses_a_host_that_cannot_go_in_a_header(host):
+    """A control byte in Host would end the ``location`` field early.
+
+    A bare LF is a line terminator to a good few parsers even though this
+    server does not treat it as one, so the answer would carry a header the
+    client never wrote - and the value is attacker controlled.
+    """
+    assert build_location(CONFIG, b"/x", host) is None
+
+
+def test_location_refuses_an_absolute_target_with_a_control_byte():
+    assert build_location(CONFIG, b"http://example.com\nX-Injected: 1/x", b"") is None
+
+
 # A live redirect listener
 def _free_port() -> int:
     with socket.socket() as probe:
@@ -157,6 +181,28 @@ def test_a_malformed_request_line_is_answered_with_400(redirecting):
     assert response.header(b"location") is None
 
 
+def test_a_host_with_a_bare_lf_is_refused_not_reflected(redirecting):
+    """The listener parses its own headers, so it validates them itself."""
+    _, port = redirecting
+    connection = socket.create_connection(("127.0.0.1", port), timeout=5)
+    try:
+        connection.sendall(b"GET /x HTTP/1.1\r\nHost: example.com\nX-Injected: yes\r\n\r\n")
+        raw = b""
+        while True:
+            try:
+                data = connection.recv(65536)
+            except (socket.timeout, OSError):
+                break
+            if not data:
+                break
+            raw += data
+    finally:
+        connection.close()
+    assert raw.startswith(b"HTTP/1.1 400"), raw[:40]
+    assert b"X-Injected" not in raw
+    assert b"location" not in raw.lower()
+
+
 def test_the_redirect_never_reaches_the_application(redirecting):
     """The redirect listener is separate: the app still serves the TLS port."""
     server, port = redirecting
@@ -169,6 +215,31 @@ def test_the_redirect_never_reaches_the_application(redirecting):
         sock.close()
     assert response.status == 200
     assert response.body == b"Hello, World!"
+
+
+def test_the_redirect_listener_is_rate_limited(tmp_path):
+    """The plaintext listener is the one an abusive client finds first."""
+    certfile, keyfile = write_self_signed_cert(tmp_path)
+    port = _free_port()
+    with ServerThread(
+        certfile=certfile,
+        keyfile=keyfile,
+        redirect_enabled=True,
+        redirect_host="127.0.0.1",
+        redirect_port=port,
+        ratelimit_enabled=True,
+        ratelimit_requests=1,
+        ratelimit_peak=1,
+        ratelimit_window=1.0,
+        ratelimit_ban=1.0,
+    ):
+        _wait_until_listening(port)
+        assert _request(port, "/").status == 308
+        refused = _request(port, "/")
+        assert refused.status == 429
+        assert refused.header(b"retry-after") == b"1"
+        assert refused.header(b"connection") == b"close"
+        assert refused.header(b"location") is None
 
 
 # The command line: many workers, one redirect listener

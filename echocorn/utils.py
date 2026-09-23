@@ -15,8 +15,8 @@ import socket
 import struct
 import time
 import zlib
+from collections.abc import Callable, Iterable, Sequence
 from http import HTTPStatus
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import unquote
 
 __all__ = [
@@ -35,9 +35,13 @@ __all__ = [
     "ASGIRequest",
     "BodyAbandoned",
     "Compressor",
+    "ResponseAborted",
     "access_log",
+    "add_vary",
     "authority_host",
+    "valid_authority",
     "compressible_content_type",
+    "compressible_response",
     "decode_path",
     "force_reset",
     "tune_socket",
@@ -47,15 +51,16 @@ __all__ = [
     "bodyless_header_drops",
     "negotiate_content_encoding",
     "normalize_response_headers",
+    "refusal_log",
     "response_has_body",
     "should_compress",
     "status_phrase",
 ]
 
-HeaderPair = Tuple[bytes, bytes]
-Headers = List[HeaderPair]
+HeaderPair = tuple[bytes, bytes]
+Headers = list[HeaderPair]
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 SERVER_HEADER = "echocorn/" + VERSION
 
 #: Methods both protocol handlers accept (RFC 9110 section 9).
@@ -148,12 +153,32 @@ _PRECOMPRESSED = (
     b"image/gif",
     b"image/webp",
     b"image/avif",
+    b"image/jxl",
+    b"image/heic",
+    b"image/heif",
     b"video/",
     b"audio/",
     b"application/zip",
+    b"application/x-zip-compressed",
     b"application/gzip",
     b"application/x-gzip",
     b"application/zstd",
+    b"application/x-zstd",
+    b"application/bzip2",
+    b"application/x-bzip2",
+    b"application/x-7z-compressed",
+    b"application/x-rar",
+    b"application/vnd.rar",
+    b"application/x-rar-compressed",
+    b"application/x-xz",
+    b"application/x-lzip",
+    b"application/x-lzma",
+    b"application/x-compress",
+    b"font/woff",
+    b"font/woff2",
+    b"application/font-woff",
+    b"application/font-woff2",
+    b"application/epub+zip",
 )
 
 
@@ -167,7 +192,7 @@ def status_phrase(status: int) -> str:
 
 #: Cache for :func:`format_http_date`: the value only changes once a second,
 #: and building it with ``strftime`` is far from free at high request rates.
-_DATE_CACHE: Tuple[str, int] = ("", 0)
+_DATE_CACHE: tuple[str, int] = ("", 0)
 
 
 def format_http_date() -> str:
@@ -190,7 +215,7 @@ def decode_path(raw_path: bytes) -> str:
         return unquote(raw_path.decode("latin-1"))
 
 
-def tune_socket(sock: Any) -> None:
+def tune_socket(sock: object) -> None:
     """
     Set the latency and liveness options of an accepted socket.
 
@@ -201,10 +226,7 @@ def tune_socket(sock: Any) -> None:
     """
     if sock is None:
         return
-    for level, option in (
-        (socket.IPPROTO_TCP, getattr(socket, "TCP_NODELAY", None)),
-        (socket.SOL_SOCKET, getattr(socket, "SO_KEEPALIVE", None)),
-    ):
+    for level, option in ((socket.IPPROTO_TCP, getattr(socket, "TCP_NODELAY", None)), (socket.SOL_SOCKET, getattr(socket, "SO_KEEPALIVE", None))):
         if option is None:
             continue
         try:
@@ -213,7 +235,7 @@ def tune_socket(sock: Any) -> None:
             pass
 
 
-def force_reset(transport: Any) -> None:
+def force_reset(transport: object) -> None:
     """
     Close ``transport`` with a TCP reset (RST) instead of a FIN handshake.
 
@@ -245,6 +267,27 @@ def force_reset(transport: Any) -> None:
         pass
 
 
+#: A URI authority, ``uri-host [ ":" port ]`` (RFC 3986 section 3.2), with the
+#: percent-encoding spelled out so a broken escape is not read as a name.  An
+#: empty host is allowed: a client with no authority to name sends ``Host:``
+#: with an empty field value (RFC 9110 section 7.2).
+_AUTHORITY_RE = re.compile(rb"^(?:\[[0-9A-Za-z:.v]+\]|(?:[A-Za-z0-9._~!$&'()*+,;=-]|%[0-9A-Fa-f]{2})*)(?::[0-9]*)?$")
+
+
+def valid_authority(value: bytes) -> bool:
+    """
+    True when ``value`` is a well formed ``host[:port]`` authority.
+
+    RFC 9112 section 3.2 requires a server to answer ``400`` to a request whose
+    ``Host`` field value is invalid, and section 3.2.2 does the same for a
+    request target that carries userinfo, so every authority taken from a peer
+    goes through here first.  What gets through is what a routing or caching
+    hop in front of this server would also accept, which is what keeps two hops
+    from disagreeing about the site a request is for.
+    """
+    return _AUTHORITY_RE.match(value) is not None
+
+
 def authority_host(authority: bytes) -> str:
     """
     Return the host part of a ``Host``/``:authority`` value, lower-cased.
@@ -269,7 +312,7 @@ def has_header(headers: Iterable[HeaderPair], name: bytes) -> bool:
     return any(key.lower() == name_lower for key, _ in headers)
 
 
-def get_header(headers: Iterable[HeaderPair], name: bytes) -> Optional[bytes]:
+def get_header(headers: Iterable[HeaderPair], name: bytes) -> bytes | None:
     """Return the first value of ``name`` (case-insensitive) or ``None``."""
     name_lower = name.lower()
     for key, value in headers:
@@ -301,7 +344,7 @@ def _parse_quality(value: str) -> float:
     return min(1.0, max(0.0, quality))
 
 
-def negotiate_content_encoding(headers: Iterable[HeaderPair], supported: Sequence[str] = ("gzip", "deflate")) -> Optional[str]:
+def negotiate_content_encoding(headers: Iterable[HeaderPair], supported: Sequence[str] = ("gzip", "deflate")) -> str | None:
     """
     Pick the best supported content coding for ``Accept-Encoding``.
 
@@ -309,7 +352,7 @@ def negotiate_content_encoding(headers: Iterable[HeaderPair], supported: Sequenc
     section 12.5.3, including ``q=0`` (explicit rejection) and the ``*``
     wildcard. ``supported`` is ordered by server preference.
     """
-    entries: List[Tuple[str, float]] = []
+    entries: list[tuple[str, float]] = []
     for name, value in headers:
         if name.lower() != b"accept-encoding":
             continue
@@ -331,8 +374,8 @@ def negotiate_content_encoding(headers: Iterable[HeaderPair], supported: Sequenc
     if not entries:
         return None
 
-    best: Dict[str, Tuple[float, int]] = {}
-    wildcard: Optional[float] = None
+    best: dict[str, tuple[float, int]] = {}
+    wildcard: float | None = None
     for index, (token, quality) in enumerate(entries):
         if token == "*":
             wildcard = quality if wildcard is None else max(wildcard, quality)
@@ -346,11 +389,7 @@ def negotiate_content_encoding(headers: Iterable[HeaderPair], supported: Sequenc
             best.setdefault(encoding, (wildcard, len(entries)))
 
     preference = {encoding: position for position, encoding in enumerate(supported)}
-    candidates = [
-        (quality, preference[encoding], index, encoding)
-        for encoding, (quality, index) in best.items()
-        if quality > 0.0
-    ]
+    candidates = [(quality, preference[encoding], index, encoding) for encoding, (quality, index) in best.items() if quality > 0.0]
     if not candidates:
         return None
     # Highest quality first, then server preference, then client order.
@@ -367,7 +406,7 @@ def response_has_body(method: str, status: int) -> bool:
     return status not in (204, 304)
 
 
-def bodyless_header_drops(method: str, status: int) -> Tuple[bytes, ...]:
+def bodyless_header_drops(method: str, status: int) -> tuple[bytes, ...]:
     """
     Framing headers to remove from a response that cannot carry a body.
 
@@ -382,32 +421,70 @@ def bodyless_header_drops(method: str, status: int) -> Tuple[bytes, ...]:
     return (b"content-length", b"transfer-encoding")
 
 
-def should_compress(method: str, status: int, response_headers: Headers, request_headers: Headers) -> Optional[str]:
+def compressible_response(method: str, status: int, response_headers: Headers) -> bool:
+    """
+    Whether a response body is one that compression may rewrite (RFC 9110 8.4).
+
+    Body-less responses, partial responses, responses that are already
+    content-encoded and bodies that are too small to benefit are all left
+    alone.  This is the part of the decision that depends on the response
+    alone, which is what a ``Vary`` header has to be derived from.
+    """
+    if not response_has_body(method, status):
+        return False
+    if status == 206:
+        return False
+    if has_header(response_headers, b"content-encoding"):
+        return False
+    if has_header(response_headers, b"content-range"):
+        return False
+    content_type = get_header(response_headers, b"content-type")
+    if content_type is None or not compressible_content_type(content_type):
+        return False
+    content_length = get_header(response_headers, b"content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) < MIN_COMPRESS_SIZE:
+                return False
+        except ValueError:
+            return False
+    return True
+
+
+def should_compress(method: str, status: int, response_headers: Headers, request_headers: Headers) -> str | None:
     """
     Return the content coding to use for this response, if any.
 
     Applies RFC 9110 section 8.4: never compress a body-less response, a
     partial response, or a response that is already content-encoded.
     """
-    if not response_has_body(method, status):
+    if not compressible_response(method, status, response_headers):
         return None
-    if status == 206:
-        return None
-    if has_header(response_headers, b"content-encoding"):
-        return None
-    if has_header(response_headers, b"content-range"):
-        return None
-    content_type = get_header(response_headers, b"content-type")
-    if content_type is None or not compressible_content_type(content_type):
-        return None
-    content_length = get_header(response_headers, b"content-length")
-    if content_length is not None:
-        try:
-            if int(content_length) < MIN_COMPRESS_SIZE:
-                return None
-        except ValueError:
-            return None
     return negotiate_content_encoding(request_headers)
+
+
+def add_vary(headers: Headers, field: bytes = b"Accept-Encoding") -> Headers:
+    """
+    Add ``field`` to the ``Vary`` response header (RFC 9110 section 12.5.5).
+
+    A response whose content coding was negotiated from the request has to say
+    so, or a shared cache could hand the compressed body to a client that
+    cannot decode it.  An existing ``Vary`` is extended instead of replaced,
+    and the ``*`` wildcard already covers every field, so it is left alone.
+
+    Returns a new list; the header the application sent is never modified.
+    """
+    result = list(headers)
+    for index, (name, value) in enumerate(result):
+        if name.lower() != b"vary":
+            continue
+        tokens = [token.strip().lower() for token in value.split(b",") if token.strip()]
+        if b"*" in tokens or field.lower() in tokens:
+            return result
+        result[index] = (name, value + b", " + field)
+        return result
+    result.append((b"vary", field))
+    return result
 
 
 class Compressor:
@@ -439,7 +516,7 @@ class Compressor:
         return self._obj.flush(zlib.Z_FINISH)
 
 
-def normalize_response_headers(headers: Optional[Iterable[Any]], *, lowercase: bool = False, forbidden: Iterable[bytes] = ()) -> Headers:
+def normalize_response_headers(headers: Iterable[object] | None, *, lowercase: bool = False, forbidden: Iterable[bytes] = ()) -> Headers:
     """
     Validate and clean up response headers produced by an ASGI application.
 
@@ -464,6 +541,10 @@ def normalize_response_headers(headers: Optional[Iterable[Any]], *, lowercase: b
             value = value.encode("latin-1", "replace")
         if not isinstance(name, (bytes, bytearray)) or not isinstance(value, (bytes, bytearray)):
             continue
+        # ``bytes()`` returns the very same object for a ``bytes`` input, so the
+        # usual case copies nothing at all; it only normalises the rarer
+        # ``bytearray`` an application may hand us into the bytes the framing
+        # code and hyper-h2 expect.
         name = bytes(name).strip()
         value = bytes(value).strip()
         if not _HEADER_NAME_RE.match(name):
@@ -472,12 +553,20 @@ def normalize_response_headers(headers: Optional[Iterable[Any]], *, lowercase: b
         if lowered in forbidden_set:
             continue
         if lowered == b"content-length":
-            try:
-                if int(value) < 0:
-                    continue
-            except ValueError:
+            # Only DIGITs (RFC 9110 section 8.6). An application that sends
+            # ``+5`` or ``5_0`` means well, but the value it would put on the
+            # wire is not the value this server frames the body with, and a
+            # peer reading it differently (or refusing it) would desynchronise.
+            # The field is dropped instead: the body is then framed by chunking,
+            # which no peer has to interpret.
+            if _CONTENT_LENGTH_RE.match(value) is None:
                 continue
-        if b"\r" in value or b"\n" in value or b"\x00" in value:
+        # RFC 9110 section 5.5: a field value holds VCHAR, SP, HTAB and
+        # obs-text - no other C0 control. A bare LF is a line terminator to a
+        # good many parsers even though it is not one here, and an application
+        # that reflects something a client sent (a query parameter into a
+        # header, say) must not be able to hand it a field of its own.
+        if _ILLEGAL_VALUE_RE.search(value):
             continue
         result.append((lowered if lowercase else name, value))
     return result
@@ -486,6 +575,13 @@ def normalize_response_headers(headers: Optional[Iterable[Any]], *, lowercase: b
 #: A header field name is a token (RFC 9110 section 5.1); anything else - a
 #: space, a colon, CRLF - is refused instead of being written to the wire.
 _HEADER_NAME_RE = re.compile(rb"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+
+#: ``Content-Length`` is 1*DIGIT (RFC 9110 section 8.6): no sign, no
+#: underscores, nothing ``int()`` would quietly read as a number.
+_CONTENT_LENGTH_RE = re.compile(rb"^[0-9]+$")
+
+#: Every C0 control byte except horizontal tab, plus DEL (RFC 9110 section 5.5).
+_ILLEGAL_VALUE_RE = re.compile(rb"[\x00-\x08\x0a-\x1f\x7f]")
 
 #: Control characters are escaped in log fields, so a hostile request line
 #: cannot forge extra log entries.
@@ -499,7 +595,7 @@ def _log_field(value: str) -> str:
     return _CONTROL_RE.sub(lambda match: "\\x%02x" % ord(match.group()), value)
 
 
-def access_log(logger: logging.Logger, protocol: str, client: Optional[Tuple[Any, ...]], method: Optional[str], target: str, status: int, elapsed: float, messages: Optional[int] = None) -> None:
+def access_log(logger: logging.Logger, protocol: str, client: tuple[object, ...] | None, method: str | None, target: str, status: int, elapsed: float, messages: int | None = None) -> None:
     """
     Emit one access log line, in the same shape for every protocol::
 
@@ -525,8 +621,44 @@ def access_log(logger: logging.Logger, protocol: str, client: Optional[Tuple[Any
     logger.info(", ".join(parts))
 
 
+def refusal_log(logger: logging.Logger, protocol: str, client: tuple[object, ...] | None, method: str | None, target: str, status: int, reason: str = "") -> None:
+    """
+    Report a request the server refused itself, at WARN, naming the client.
+
+    These are the answers the application never sees - a misdirected request, a
+    method that is not allowed, a head that was too large, a rate limited
+    client - so the operator needs the address and the reason in the log to
+    know who is doing it and why.  The line follows the shape of an access log
+    line, with the reason (when there is one) at the end::
+
+        h11, ip=127.0.0.1, method=GET, path=/x, code=421, reason=misdirected request
+    """
+    if not logger.isEnabledFor(logging.WARNING):
+        return
+    host = str(client[0]) if client else "-"
+    parts = ["%s, ip=%s" % (protocol, _log_field(host))]
+    if method:
+        parts.append("method=%s" % _log_field(method))
+    parts.append("path=%s" % _log_field(target or "-"))
+    parts.append("code=%d" % status)
+    if reason:
+        parts.append("reason=%s" % _log_field(reason))
+    logger.warning(", ".join(parts))
+
+
 class BodyAbandoned(Exception):
     """Raised internally when the app responded before reading the body."""
+
+
+class ResponseAborted(Exception):
+    """
+    Raised by an application that cannot finish the response it started.
+
+    The writers must then abandon the framing instead of terminating it: a
+    truncated body that ends with a chunk terminator, or an END_STREAM frame,
+    is indistinguishable from a complete one, so a client would treat a half
+    written answer - a proxied file whose upstream died, say - as whole.
+    """
 
 
 class ASGIRequest:
@@ -558,9 +690,11 @@ class ASGIRequest:
         "target",
         "trailers_announced",
         "trailers_sent",
+        "body_ended",
+        "aborted",
     )
 
-    def __init__(self, scope: Dict[str, Any], logger: logging.Logger, *, recv_maxsize: int = 16, send_maxsize: int = 32, ack_fn: Optional[Callable[[int], None]] = None, on_first_receive: Optional[Callable[[], Any]] = None) -> None:
+    def __init__(self, scope: dict[str, object], logger: logging.Logger, *, recv_maxsize: int = 16, send_maxsize: int = 32, ack_fn: Callable[[int], None] | None = None, on_first_receive: Callable[[], object] | None = None) -> None:
         self.scope = scope
         self.logger = logger
         self.recv_q: asyncio.Queue = asyncio.Queue(maxsize=recv_maxsize)
@@ -573,22 +707,29 @@ class ASGIRequest:
         self.response_complete = asyncio.Event()
         self.finished = False
         self.disconnected = False
-        self.app_task: Optional[asyncio.Task] = None
+        self.app_task: asyncio.Task | None = None
         self.ack_fn = ack_fn
         self.on_first_receive = on_first_receive
         # Response bookkeeping shared with the protocol writers.
         self.keep_alive = True
         self.start_time = time.monotonic()
         self.bytes_sent = 0
-        self.status: Optional[int] = None
+        self.status: int | None = None
         self.trailers_announced = False
         self.trailers_sent = False
+        #: Whether the application sent a terminal response message, so the
+        #: framing is already complete.  A framework that answers an error and
+        #: then re-raises it (Starlette does) must not lose the answer it sent.
+        self.body_ended = False
+        #: Set when the application gave up on a response it had started, so
+        #: the framing is dropped instead of terminated (see ResponseAborted).
+        self.aborted = False
         self.target = scope.get("path", "/")
         if scope.get("query_string"):
             self.target = "%s?%s" % (self.target, scope["query_string"].decode("latin-1"))
 
     # Producer side, called by the protocol handler.
-    def feed_request(self, message: Dict[str, Any], flow_size: int = 0) -> int:
+    def feed_request(self, message: dict[str, object], flow_size: int = 0) -> int:
         """
         Queue an ``http.request`` message without blocking.
 
@@ -639,14 +780,14 @@ class ASGIRequest:
                 pass
         self.recv_space.set()
 
-    async def next_response_message(self) -> Dict[str, Any]:
+    async def next_response_message(self) -> dict[str, object]:
         """Await the next ASGI response message, releasing send backpressure."""
         message = await self.send_q.get()
         self.send_space.set()
         return message
 
     # ASGI callables.
-    async def receive(self) -> Dict[str, Any]:
+    async def receive(self) -> dict[str, object]:
         callback, self.on_first_receive = self.on_first_receive, None
         if callback is not None:
             result = callback()
@@ -660,7 +801,7 @@ class ASGIRequest:
             self.ack_fn(flow_size)
         return message
 
-    async def send(self, message: Dict[str, Any]) -> None:
+    async def send(self, message: dict[str, object]) -> None:
         if not isinstance(message, dict):
             raise TypeError("ASGI message must be a dict, got %r" % type(message))
         message_type = message.get("type")
@@ -693,9 +834,20 @@ class ASGIRequest:
             body = message.get("body") or b""
             if not isinstance(body, (bytes, bytearray, memoryview)):
                 raise ValueError("http.response.body body must be bytes")
+            if not isinstance(body, (bytes, bytearray)):
+                # Anything else that exposes the buffer protocol - a memoryview
+                # an application still holds, say - is normalised once, here.
+                # The bytes and bytearray that applications normally send are
+                # passed on untouched: ``zlib.compress``, ``transport.write``,
+                # ``h2.send_data`` and the chunked framing all take a bytearray,
+                # so copying them would duplicate a payload that can be
+                # megabytes long.
+                body = bytes(body)
             message = dict(message)
-            message["body"] = bytes(body)
+            message["body"] = body
             message["more_body"] = bool(message.get("more_body", False))
+            if not message["more_body"] and not message.get("aborted"):
+                self.body_ended = True
         elif message_type == "http.response.trailers":
             if not self.response_started:
                 raise RuntimeError("http.response.trailers sent before http.response.start")
@@ -703,6 +855,8 @@ class ASGIRequest:
             message["headers"] = list(message.get("headers") or [])
             message["more_trailers"] = bool(message.get("more_trailers", False))
             self.trailers_sent = True
+            if not message["more_trailers"]:
+                self.body_ended = True
         else:
             self.logger.debug("Ignoring unsupported ASGI message type %r", message_type)
             return
@@ -713,7 +867,7 @@ class ASGIRequest:
         if not await self._enqueue(message):
             self.logger.warning("Application sent after the response completed")
 
-    async def _enqueue(self, message: Dict[str, Any]) -> bool:
+    async def _enqueue(self, message: dict[str, object]) -> bool:
         """Queue a response message, waiting for the writer to catch up."""
         while not self.finished:
             try:
@@ -733,20 +887,41 @@ class ASGIRequest:
             await app(self.scope, self.receive, self.send)
         except asyncio.CancelledError:
             raise
+        except ResponseAborted as exc:
+            # A response the application cannot finish (a proxy whose upstream
+            # died mid-answer). The client must be able to tell, so the framing
+            # is abandoned rather than terminated.
+            if self.response_started and not self.body_ended:
+                self.logger.warning("Abandoning an incomplete response: %s", exc)
+                self.aborted = True
+                await self._put_end(aborted=True)
+            elif self.response_started:
+                # The answer was already complete: the abort came too late to
+                # change anything, so it is only reported.
+                self.logger.warning("Ignoring an abort of a completed response: %s", exc)
+            else:
+                self.logger.warning("The application aborted before answering: %s", exc)
+                self.response_started = True
+                await self._put({"type": "http.response.start", "status": 502, "headers": []})
+                await self._put({"type": "http.response.body", "body": b"Bad Gateway", "more_body": False})
+            return
         except Exception:
             self.logger.exception("Exception in ASGI application")
             if not self.response_started:
                 self.response_started = True
                 await self._put({"type": "http.response.start", "status": 500, "headers": []})
-                await self._put(
-                    {
-                        "type": "http.response.body",
-                        "body": b"Internal Server Error",
-                        "more_body": False,
-                    }
-                )
-            else:
-                # Headers are already on the wire; terminate the stream cleanly.
+                await self._put({"type": "http.response.body", "body": b"Internal Server Error", "more_body": False})
+            elif not self.body_ended:
+                # The headers are already on the wire, so the answer cannot be
+                # replaced; it is abandoned rather than terminated, because an
+                # application that blew up halfway through its body must not
+                # produce something that looks complete.
+                self.logger.warning("Abandoning a response after an exception")
+                self.aborted = True
+                await self._put_end(aborted=True)
+            elif self.trailers_announced and not self.trailers_sent:
+                # The framework answered and then re-raised (Starlette does):
+                # its answer is on the wire, only the trailer block is missing.
                 await self._finish()
             return
         if not self.response_complete.is_set():
@@ -757,7 +932,7 @@ class ASGIRequest:
                 await self._put({"type": "http.response.start", "status": 204, "headers": []})
             await self._finish()
 
-    async def _put(self, message: Dict[str, Any]) -> None:
+    async def _put(self, message: dict[str, object]) -> None:
         await self._enqueue(message)
 
     async def _finish(self) -> None:
@@ -772,7 +947,23 @@ class ASGIRequest:
             self.trailers_sent = True
             await self._put({"type": "http.response.trailers", "headers": [], "more_trailers": False})
             return
+        if self.body_ended:
+            # The application already terminated the response: sending another
+            # terminal message would only race the writer's own completion.
+            return
         await self._put_end()
 
-    async def _put_end(self) -> None:
-        await self._put({"type": "http.response.body", "body": b"", "more_body": False})
+    async def _put_end(self, aborted: bool = False) -> None:
+        """
+        Queue the terminal body message.
+
+        ``aborted`` marks it as the end of a response that could not be
+        finished.  The mark travels with the message - not in a flag on the
+        request - so the writer knows exactly where the answer stops: every
+        body message queued before it was produced while the exchange was
+        still healthy and is written out normally.
+        """
+        message: dict[str, object] = {"type": "http.response.body", "body": b"", "more_body": False}
+        if aborted:
+            message["aborted"] = True
+        await self._put(message)

@@ -16,7 +16,7 @@ import os
 import socket
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from collections.abc import Callable
 
 import pytest
 
@@ -28,7 +28,7 @@ from echocorn import ASGIServer, ServerConfig
 from echocorn import websocket as ws
 
 #: Shared state the WebSocket test application records for assertions.
-WS_STATE: Dict[str, Any] = {}
+WS_STATE: dict[str, object] = {}
 
 # Reference ASGI application
 
@@ -151,7 +151,7 @@ async def app(scope, receive, send):
         return
 
     if path == "/echo":
-        chunks: List[bytes] = []
+        chunks: list[bytes] = []
         while True:
             message = await receive()
             if message["type"] == "http.disconnect":
@@ -262,6 +262,37 @@ async def app(scope, receive, send):
                 "status": 200,
                 "headers": [(b"content-type", b"text/plain; charset=utf-8"),
                             (b"content-length", str(len(body)).encode())],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+        return
+
+    if path in ("/bytearray-body", "/memoryview-body"):
+        # Applications hand the server a mutable buffer, or a view of one that
+        # they still own; either way the server has to frame it on the wire.
+        raw = b"buffered body " * 200
+        body: object = bytearray(raw) if path == "/bytearray-body" else memoryview(raw)
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"application/octet-stream")],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+        return
+
+    if path == "/vary":
+        # A compressible body that already carries a Vary of its own, so the
+        # negotiated coding has to extend it rather than replace it.
+        body = b"compression test payload " * 200
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/plain; charset=utf-8"),
+                            (b"content-length", str(len(body)).encode()),
+                            (b"vary", b"Accept-Language")],
             }
         )
         await send({"type": "http.response.body", "body": body})
@@ -420,6 +451,19 @@ async def app(scope, receive, send):
     if path == "/boom":
         raise RuntimeError("boom")
 
+    if path == "/crash-mid-body":
+        # Starts an answer, sends part of it, then blows up: the framing must
+        # not end as though the response were whole.
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/plain")],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"half", "more_body": True})
+        raise RuntimeError("half way")
+
     if path == "/no-more-body":
         # Forgets ``more_body=False`` and returns.
         await send(
@@ -464,7 +508,7 @@ def new_test_loop() -> asyncio.AbstractEventLoop:
 class ServerThread:
     """Runs :class:`ASGIServer` in a daemon thread on an ephemeral port."""
 
-    def __init__(self, application: Callable = app, **options: Any) -> None:
+    def __init__(self, application: Callable = app, **options: object) -> None:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("127.0.0.1", 0))
@@ -474,9 +518,9 @@ class ServerThread:
         options.setdefault("access_log", False)
         config = ServerConfig(host="127.0.0.1", port=0, **options)
         self.server = ASGIServer(application, config)
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._thread: Optional[threading.Thread] = None
-        self.error: Optional[BaseException] = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self.error: BaseException | None = None
 
     def __enter__(self) -> "ServerThread":
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -492,7 +536,7 @@ class ServerThread:
                 return self
         raise RuntimeError("server did not start in time")
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         self.stop()
 
     def _run(self) -> None:
@@ -547,24 +591,24 @@ def compression_server():
 class Response:
     """A parsed HTTP/1.1 response."""
 
-    def __init__(self, status: int, headers: Dict[bytes, List[bytes]], body: bytes, raw: bytes) -> None:
+    def __init__(self, status: int, headers: dict[bytes, list[bytes]], body: bytes, raw: bytes) -> None:
         self.status = status
         self.headers = headers
         self.body = body
         self.raw = raw
 
-    def header(self, name: bytes) -> Optional[bytes]:
+    def header(self, name: bytes) -> bytes | None:
         values = self.headers.get(name.lower())
         return values[0] if values else None
 
-    def header_all(self, name: bytes) -> List[bytes]:
+    def header_all(self, name: bytes) -> list[bytes]:
         return self.headers.get(name.lower(), [])
 
 
-def _parse_head(head: bytes) -> Tuple[int, Dict[bytes, List[bytes]]]:
+def _parse_head(head: bytes) -> tuple[int, dict[bytes, list[bytes]]]:
     lines = head.split(b"\r\n")
     status = int(lines[0].split(b" ")[1])
-    headers: Dict[bytes, List[bytes]] = {}
+    headers: dict[bytes, list[bytes]] = {}
     for line in lines[1:]:
         if not line:
             continue
@@ -573,7 +617,7 @@ def _parse_head(head: bytes) -> Tuple[int, Dict[bytes, List[bytes]]]:
     return status, headers
 
 
-def complete_chunked_length(data: bytes) -> Optional[int]:
+def complete_chunked_length(data: bytes) -> int | None:
     """Return the total length of a complete chunked body, or ``None``.
 
     Handles trailer sections, which terminate with an empty line after the
@@ -701,10 +745,10 @@ def http1_request(
 def build_request(
     method: str = "GET",
     target: str = "/",
-    headers: Optional[List[Tuple[str, str]]] = None,
+    headers: list[tuple[str, str]] | None = None,
     body: bytes = b"",
     version: str = "1.1",
-    host: Optional[str] = None,
+    host: str | None = None,
 ) -> bytes:
     lines = ["%s %s HTTP/%s" % (method, target, version)]
     if host is not None:
@@ -720,11 +764,11 @@ def build_request(
 
 class H2Response:
     def __init__(self) -> None:
-        self.headers: List[Tuple[bytes, bytes]] = []
+        self.headers: list[tuple[bytes, bytes]] = []
         self.body = bytearray()
         self.ended = False
-        self.reset: Optional[int] = None
-        self.trailers: List[Tuple[bytes, bytes]] = []
+        self.reset: int | None = None
+        self.trailers: list[tuple[bytes, bytes]] = []
 
     @property
     def status(self) -> int:
@@ -733,7 +777,7 @@ class H2Response:
                 return int(value)
         raise AssertionError("no :status in response")
 
-    def header(self, name: bytes) -> Optional[bytes]:
+    def header(self, name: bytes) -> bytes | None:
         for key, value in self.headers:
             if key == name:
                 return value
@@ -747,8 +791,8 @@ class H2Client:
         self,
         server: ServerThread,
         timeout: float = 10.0,
-        initial_window_size: Optional[int] = None,
-        sock: Optional[socket.socket] = None,
+        initial_window_size: int | None = None,
+        sock: socket.socket | None = None,
     ) -> None:
         self.server = server
         self.sock = sock if sock is not None else server.connect(timeout=timeout)
@@ -761,11 +805,11 @@ class H2Client:
                 {h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: initial_window_size}
             )
         self.sock.sendall(self.conn.data_to_send())
-        self.responses: Dict[int, H2Response] = {}
-        self.informational: List[List[Tuple[bytes, bytes]]] = []
-        self.ping_acks: List[bytes] = []
-        self.goaway: Optional[int] = None
-        self.resets: List[int] = []
+        self.responses: dict[int, H2Response] = {}
+        self.informational: list[list[tuple[bytes, bytes]]] = []
+        self.ping_acks: list[bytes] = []
+        self.goaway: int | None = None
+        self.resets: list[int] = []
 
     def close(self) -> None:
         try:
@@ -776,7 +820,7 @@ class H2Client:
     def __enter__(self) -> "H2Client":
         return self
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         self.close()
 
     def _pump(self, predicate: Callable[[], bool], timeout: float = 10.0) -> None:
@@ -798,7 +842,7 @@ class H2Client:
             if outgoing:
                 self.sock.sendall(outgoing)
 
-    def _handle(self, event: Any) -> None:
+    def _handle(self, event: object) -> None:
         if isinstance(event, h2.events.ResponseReceived):
             response = self.responses.setdefault(event.stream_id, H2Response())
             response.headers = list(event.headers)
@@ -867,9 +911,9 @@ class H2Client:
         path: str = "/",
         method: str = "GET",
         body: bytes = b"",
-        headers: Optional[List[Tuple[bytes, bytes]]] = None,
-        stream_id: Optional[int] = None,
-        end_stream: Optional[bool] = None,
+        headers: list[tuple[bytes, bytes]] | None = None,
+        stream_id: int | None = None,
+        end_stream: bool | None = None,
     ) -> int:
         if stream_id is None:
             stream_id = self.conn.get_next_available_stream_id()
@@ -907,10 +951,10 @@ class WSClient:
         self,
         server: ServerThread,
         path: str = "/ws",
-        headers: Optional[List[Tuple[bytes, bytes]]] = None,
+        headers: list[tuple[bytes, bytes]] | None = None,
         timeout: float = 5.0,
-        extra_lines: Optional[List[bytes]] = None,
-        sock: Optional[socket.socket] = None,
+        extra_lines: list[bytes] | None = None,
+        sock: socket.socket | None = None,
     ) -> None:
         self.sock = sock if sock is not None else server.connect(timeout=timeout)
         self.sock.settimeout(timeout)
@@ -928,8 +972,8 @@ class WSClient:
         request.extend(extra_lines or ())
         self.sock.sendall(b"\r\n".join(request) + b"\r\n\r\n")
         self.buffer = bytearray()
-        self.status: Optional[int] = None
-        self.response_headers: Dict[bytes, bytes] = {}
+        self.status: int | None = None
+        self.response_headers: dict[bytes, bytes] = {}
         self._read_head()
 
     def _read_head(self) -> None:
@@ -955,7 +999,7 @@ class WSClient:
     def __enter__(self) -> "WSClient":
         return self
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         self.close()
 
     # client -> server
@@ -981,7 +1025,7 @@ class WSClient:
         self.send_frame(ws.OPCODE_CLOSE, code.to_bytes(2, "big") + reason)
 
     # server -> client
-    def _try_parse(self) -> Optional[Tuple[bool, int, bytes]]:
+    def _try_parse(self) -> tuple[bool, int, bytes] | None:
         buffer = self.buffer
         if len(buffer) < 2:
             return None
@@ -1007,7 +1051,7 @@ class WSClient:
         del buffer[: offset + length]
         return fin, opcode, payload
 
-    def recv_frame(self, timeout: float = 5.0) -> Tuple[bool, int, bytes]:
+    def recv_frame(self, timeout: float = 5.0) -> tuple[bool, int, bytes]:
         self.sock.settimeout(timeout)
         while True:
             frame = self._try_parse()
@@ -1018,10 +1062,10 @@ class WSClient:
                 raise AssertionError("connection closed while waiting for a frame")
             self.buffer.extend(chunk)
 
-    def recv_message(self, timeout: float = 5.0) -> Tuple[str, Any]:
+    def recv_message(self, timeout: float = 5.0) -> tuple[str, object]:
         """Read a data message, handling ping/pong and fragmentation."""
         payload = bytearray()
-        opcode: Optional[int] = None
+        opcode: int | None = None
         deadline = time.time() + timeout
         while True:
             remaining = max(0.1, deadline - time.time())
@@ -1073,7 +1117,7 @@ def _close_code(payload: bytes) -> int:
 # TLS helpers (shared by the TLS and WebSocket suites)
 
 
-def write_self_signed_cert(directory: Any) -> Tuple[str, str]:
+def write_self_signed_cert(directory: object) -> tuple[str, str]:
     """Write a self signed certificate for localhost and return its paths."""
     import datetime
     import ipaddress
@@ -1120,14 +1164,14 @@ def write_self_signed_cert(directory: Any) -> Tuple[str, str]:
 
 
 @pytest.fixture()
-def tls_server(tmp_path: Any):
+def tls_server(tmp_path: object):
     """A compression enabled TLS server with a freshly generated certificate."""
     certfile, keyfile = write_self_signed_cert(tmp_path)
     with ServerThread(certfile=certfile, keyfile=keyfile, compression=True) as instance:
         yield instance
 
 
-def tls_socket(server: ServerThread, protocols: List[str]) -> Any:
+def tls_socket(server: ServerThread, protocols: list[str]) -> object:
     """Open a TLS socket to ``server`` offering ``protocols`` over ALPN."""
     import ssl
 

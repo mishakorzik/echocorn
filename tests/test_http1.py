@@ -520,6 +520,77 @@ def test_compression_skipped_when_rejected(compression_server: ServerThread):
     assert b"content-encoding" not in headers
 
 
+def test_a_negotiated_response_says_vary(compression_server: ServerThread):
+    """A shared cache must be told what the answer depended on (RFC 9110 12.5.5)."""
+    raw = http1_request(
+        compression_server,
+        build_request(
+            target="/compressible",
+            host="localhost",
+            headers=[("Accept-Encoding", "gzip")],
+        ),
+    )
+    status, headers, body, _ = _parse(raw)
+    assert headers[b"content-encoding"] == [b"gzip"]
+    assert headers[b"vary"] == [b"Accept-Encoding"]
+
+
+def test_vary_is_sent_even_when_the_client_refuses_every_coding(
+    compression_server: ServerThread,
+):
+    raw = http1_request(
+        compression_server,
+        build_request(
+            target="/compressible",
+            host="localhost",
+            headers=[("Accept-Encoding", "gzip;q=0, deflate;q=0")],
+        ),
+    )
+    status, headers, body, _ = _parse(raw)
+    assert b"content-encoding" not in headers
+    assert headers[b"vary"] == [b"Accept-Encoding"]
+
+
+def test_a_vary_the_application_set_is_extended(compression_server: ServerThread):
+    raw = http1_request(
+        compression_server,
+        build_request(
+            target="/vary",
+            host="localhost",
+            headers=[("Accept-Encoding", "deflate")],
+        ),
+    )
+    status, headers, body, _ = _parse(raw)
+    assert headers[b"content-encoding"] == [b"deflate"]
+    assert headers[b"vary"] == [b"Accept-Language, Accept-Encoding"]
+
+
+def test_a_response_that_is_not_negotiated_has_no_vary(compression_server: ServerThread):
+    raw = http1_request(
+        compression_server,
+        build_request(target="/", host="localhost", headers=[("Accept-Encoding", "gzip")]),
+    )
+    status, headers, body, _ = _parse(raw)
+    assert b"vary" not in headers
+
+
+# Response bodies an application hands over as a buffer
+def test_a_bytearray_body_is_framed(server: ServerThread):
+    """The body is not copied into ``bytes`` on its way to the wire."""
+    raw = http1_request(server, build_request(target="/bytearray-body", host="localhost"))
+    status, headers, body, _ = _parse(raw)
+    assert status == 200
+    assert headers[b"transfer-encoding"] == [b"chunked"]
+    assert body == b"buffered body " * 200
+
+
+def test_a_memoryview_body_is_framed(server: ServerThread):
+    raw = http1_request(server, build_request(target="/memoryview-body", host="localhost"))
+    status, headers, body, _ = _parse(raw)
+    assert status == 200
+    assert body == b"buffered body " * 200
+
+
 # Misc
 def test_scope_headers_are_lowercased(server: ServerThread):
     raw = http1_request(

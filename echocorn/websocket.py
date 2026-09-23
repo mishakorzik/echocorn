@@ -27,7 +27,7 @@ import base64
 import binascii
 import hashlib
 import logging
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from collections.abc import Callable, Iterable
 
 from . import utils
 from .config import ServerConfig
@@ -68,7 +68,20 @@ CLOSE_INTERNAL_ERROR = 1011
 
 #: Codes a peer may legitimately send in a close frame (RFC 6455 section 7.4).
 _ACCEPTED_CLOSE_CODES = frozenset(
-    {1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014}
+    {
+        1000,
+        1001,
+        1002,
+        1003,
+        1007,
+        1008,
+        1009,
+        1010,
+        1011,
+        1012,
+        1013,
+        1014
+    }
 )
 
 
@@ -94,12 +107,12 @@ def valid_key(key: bytes) -> bool:
         return False
 
 
-def build_close_frame(code: int, reason: str = "", mask: Optional[bytes] = None) -> bytes:
+def build_close_frame(code: int, reason: str = "", mask: bytes | None = None) -> bytes:
     """Serialise a close frame, with or without a mask key."""
     return build_frame(OPCODE_CLOSE, _close_payload(code, reason), mask=mask)
 
 
-def build_frame(opcode: int, payload: bytes = b"", fin: bool = True, mask: Optional[bytes] = None) -> bytes:
+def build_frame(opcode: int, payload: bytes = b"", fin: bool = True, mask: bytes | None = None) -> bytes:
     """Serialise one frame. Server frames are not masked (RFC 6455 section 5.3)."""
     header = bytearray()
     header.append((_FIN if fin else 0) | opcode)
@@ -128,7 +141,7 @@ def _mask_payload(payload: bytes, mask: bytes) -> bytes:
     return (int.from_bytes(payload, "big") ^ int.from_bytes(repeated, "big")).to_bytes(length, "big")
 
 
-def wants_websocket(headers: Iterable[Tuple[bytes, bytes]]) -> bool:
+def wants_websocket(headers: Iterable[tuple[bytes, bytes]]) -> bool:
     """True when the request asks for an ``Upgrade: websocket`` handshake."""
     upgrade = False
     connection_upgrade = False
@@ -143,9 +156,9 @@ def wants_websocket(headers: Iterable[Tuple[bytes, bytes]]) -> bool:
     return upgrade and connection_upgrade
 
 
-def subprotocols(headers: Iterable[Tuple[bytes, bytes]]) -> List[str]:
+def subprotocols(headers: Iterable[tuple[bytes, bytes]]) -> list[str]:
     """Return the ``Sec-WebSocket-Protocol`` offers in client preference order."""
-    offers: List[str] = []
+    offers: list[str] = []
     for name, value in headers:
         if name.lower() != b"sec-websocket-protocol":
             continue
@@ -160,7 +173,7 @@ def _close_payload(code: int, reason: str = "") -> bytes:
     return code.to_bytes(2, "big") + reason.encode("utf-8", "replace")
 
 
-def _parse_close(payload: bytes) -> Tuple[int, str]:
+def _parse_close(payload: bytes) -> tuple[int, str]:
     if not payload:
         return 1005, ""  # "no status received" (RFC 6455 section 7.1.5)
     if len(payload) == 1:
@@ -175,7 +188,7 @@ def _parse_close(payload: bytes) -> Tuple[int, str]:
     return code, reason
 
 
-def _parse_frame(buffer: bytearray, max_payload: int, require_mask: bool = True) -> Optional[Tuple[bool, int, bytes]]:
+def _parse_frame(buffer: bytearray, max_payload: int, require_mask: bool = True) -> tuple[bool, int, bytes] | None:
     """
     Parse one frame out of ``buffer``; ``None`` when it is incomplete.
 
@@ -224,14 +237,7 @@ def _parse_frame(buffer: bytearray, max_payload: int, require_mask: bool = True)
             raise WebSocketError(CLOSE_PROTOCOL_ERROR, "client frames must be masked")
     elif masked:
         raise WebSocketError(CLOSE_PROTOCOL_ERROR, "server frames must not be masked")
-    if opcode not in (
-        OPCODE_CONTINUATION,
-        OPCODE_TEXT,
-        OPCODE_BINARY,
-        OPCODE_CLOSE,
-        OPCODE_PING,
-        OPCODE_PONG,
-    ):
+    if opcode not in (OPCODE_CONTINUATION, OPCODE_TEXT, OPCODE_BINARY, OPCODE_CLOSE, OPCODE_PING, OPCODE_PONG):
         raise WebSocketError(CLOSE_PROTOCOL_ERROR, "unknown opcode 0x%x" % opcode)
 
     mask_size = 4 if masked else 0
@@ -253,17 +259,17 @@ class FrameParser:
     def __init__(self, max_message_size: int, require_mask: bool = True) -> None:
         self._max = max_message_size
         self._masked = require_mask
-        self._opcode: Optional[int] = None
+        self._opcode: int | None = None
         self._payload = bytearray()
 
-    def feed(self, buffer: bytearray) -> List[Tuple[str, Any]]:
+    def feed(self, buffer: bytearray) -> list[tuple[str, object]]:
         """
         Consume every complete frame in ``buffer`` and return its events.
 
         Returns a list of ``(kind, value)`` pairs where *kind* is one of
         ``text``, ``bytes``, ``ping``, ``pong`` or ``close``.
         """
-        events: List[Tuple[str, Any]] = []
+        events: list[tuple[str, object]] = []
         while True:
             frame = _parse_frame(buffer, self._max, self._masked)
             if frame is None:
@@ -309,20 +315,7 @@ class FrameParser:
 class WebSocketSession:
     """Drives one WebSocket connection until the close handshake completes."""
 
-    def __init__(
-        self,
-        app: Callable,
-        config: ServerConfig,
-        logger: logging.Logger,
-        transport: asyncio.Transport,
-        buffer: bytearray,
-        data_event: asyncio.Event,
-        scope: Dict[str, Any],
-        key: bytes,
-        write: Callable[[bytes], Any],
-        pause_reading: Callable[[], None],
-        resume_reading: Callable[[], None],
-    ) -> None:
+    def __init__(self, app: Callable, config: ServerConfig, logger: logging.Logger, transport: asyncio.Transport, buffer: bytearray, data_event: asyncio.Event, scope: dict[str, object], key: bytes, write: Callable[[bytes], object], pause_reading: Callable[[], None], resume_reading: Callable[[], None]) -> None:
         self.app = app
         self.config = config
         self.logger = logger
@@ -340,8 +333,8 @@ class WebSocketSession:
         self._queue.put_nowait({"type": "websocket.connect"})
         self._accepted = asyncio.Event()
         self._finished = asyncio.Event()
-        self._app_task: Optional[asyncio.Task] = None
-        self._reader_task: Optional[asyncio.Task] = None
+        self._app_task: asyncio.Task | None = None
+        self._reader_task: asyncio.Task | None = None
         self._read_paused = False
         self._closed = False
         self._closing = asyncio.Event()
@@ -355,7 +348,7 @@ class WebSocketSession:
         self._messages = 0
 
     @property
-    def tasks(self) -> Tuple[Optional[asyncio.Task], ...]:
+    def tasks(self) -> tuple[asyncio.Task | None, ...]:
         """The tasks this session owns, so the connection can cancel them."""
         return (self._app_task, self._reader_task)
 
@@ -375,7 +368,7 @@ class WebSocketSession:
         return self._messages
 
     @property
-    def status(self) -> Optional[int]:
+    def status(self) -> int | None:
         """
         What to report in the access log.
 
@@ -500,7 +493,7 @@ class WebSocketSession:
             self.logger.exception("WebSocket reader failed")
             await self._fail(CLOSE_INTERNAL_ERROR, "internal error")
 
-    async def _dispatch(self, kind: str, value: Any) -> None:
+    async def _dispatch(self, kind: str, value: object) -> None:
         if kind == "ping":
             await self._write(build_frame(OPCODE_PONG, value))
             return
@@ -524,21 +517,21 @@ class WebSocketSession:
         else:
             await self._deliver({"type": "websocket.receive", "bytes": value})
 
-    async def _deliver(self, message: Dict[str, Any]) -> None:
+    async def _deliver(self, message: dict[str, object]) -> None:
         """Hand a message to the application, pausing the socket when it lags."""
         if self._queue.full() and not self._read_paused:
             self._read_paused = True
             self._pause()
         await self._queue.put(message)
 
-    async def _receive(self) -> Dict[str, Any]:
+    async def _receive(self) -> dict[str, object]:
         message = await self._queue.get()
         if self._read_paused and not self._queue.full():
             self._read_paused = False
             self._resume()
         return message
 
-    async def _send(self, message: Dict[str, Any]) -> None:
+    async def _send(self, message: dict[str, object]) -> None:
         if not isinstance(message, dict):
             raise TypeError("ASGI message must be a dict, got %r" % type(message))
         message_type = message.get("type")
@@ -555,7 +548,7 @@ class WebSocketSession:
         else:
             self.logger.warning("Ignoring unknown ASGI message %r", message_type)
 
-    async def _accept(self, message: Dict[str, Any]) -> None:
+    async def _accept(self, message: dict[str, object]) -> None:
         if self._accepted_handshake:
             raise RuntimeError("websocket.accept has already been sent")
         headers = bytearray()
@@ -572,10 +565,10 @@ class WebSocketSession:
             headers.extend(b"sec-websocket-protocol: " + chosen.encode("latin-1") + b"\r\n")
         headers.extend(b"\r\n")
         self._accepted_handshake = True
-        await self._write(bytes(headers))
+        await self._write(headers)
         self._accepted.set()
 
-    async def _send_data(self, message: Dict[str, Any]) -> None:
+    async def _send_data(self, message: dict[str, object]) -> None:
         if not self._accepted_handshake:
             raise RuntimeError("websocket.send before websocket.accept")
         if self._closed:
@@ -583,9 +576,9 @@ class WebSocketSession:
             return
         data = message.get("bytes")
         if data is not None:
-            if not isinstance(data, (bytes, bytearray, memoryview)):
+            if not isinstance(data, (bytes, bytearray)):
                 raise TypeError("websocket.send 'bytes' must be bytes-like")
-            await self._write(build_frame(OPCODE_BINARY, bytes(data)))
+            await self._write(build_frame(OPCODE_BINARY, data))
             return
         text = message.get("text")
         if text is None:
@@ -594,7 +587,7 @@ class WebSocketSession:
             raise TypeError("websocket.send 'text' must be str")
         await self._write(build_frame(OPCODE_TEXT, text.encode("utf-8")))
 
-    async def _close(self, message: Dict[str, Any]) -> None:
+    async def _close(self, message: dict[str, object]) -> None:
         code = int(message.get("code", CLOSE_NORMAL))
         reason = str(message.get("reason", "") or "")
         if not self._accepted_handshake:
@@ -621,7 +614,7 @@ class WebSocketSession:
         await self._write(head + body)
         self._accepted.set()
 
-    async def _reject_start(self, message: Dict[str, Any]) -> None:
+    async def _reject_start(self, message: dict[str, object]) -> None:
         """
         Begin an HTTP response to a refused handshake.
 
@@ -660,15 +653,15 @@ class WebSocketSession:
         parts.append(b"\r\n")
         await self._write(b"".join(parts))
 
-    async def _reject_body(self, message: Dict[str, Any]) -> None:
+    async def _reject_body(self, message: dict[str, object]) -> None:
         """Send one chunk of the rejection body; the last one ends the session."""
         if not self._rejecting:
             raise RuntimeError("websocket.http.response.body before websocket.http.response.start")
         body = message.get("body", b"") or b""
-        if not isinstance(body, (bytes, bytearray, memoryview)):
+        if not isinstance(body, (bytes, bytearray)):
             raise TypeError("websocket.http.response.body must be bytes-like")
         if body:
-            await self._write(bytes(body))
+            await self._write(body)
         if message.get("more_body"):
             return
         self._accepted_handshake = False

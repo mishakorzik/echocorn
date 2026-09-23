@@ -21,20 +21,26 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Any, Optional, Set
 
 from . import utils
 from .config import ServerConfig
+from .ratelimit import RateLimiter, client_key, retry_after_seconds
 
 __all__ = ["RedirectProtocol", "build_location"]
 
 #: A request target is visible ASCII only: it is copied into ``Location`` and
 #: must not be able to break that header open.
 _ILLEGAL_TARGET_RE = re.compile(rb"[\x00-\x20\x7f]")
+
+#: The same for the authority: an authority never holds a space or a control
+#: byte (RFC 3986 section 3.2), and every one of them that reached ``Location``
+#: would end the field early - or the whole response, with a bare LF, which is
+#: a line terminator to a good few parsers even though it is not one here.
+_ILLEGAL_AUTHORITY_RE = re.compile(rb"[\x00-\x20\x7f]")
 _REQUEST_LINE_RE = re.compile(rb"^([A-Za-z]+) ([^ ]+) HTTP/([0-9]\.[0-9])$")
 
 
-def _target_authority(config: ServerConfig, host: bytes, https_port: Optional[int] = None) -> bytes:
+def _target_authority(config: ServerConfig, host: bytes, https_port: int | None = None) -> bytes:
     """
     Return the authority to use in ``Location``.
 
@@ -45,6 +51,8 @@ def _target_authority(config: ServerConfig, host: bytes, https_port: Optional[in
     request carried, and is left out for the default port 443.
     """
     name = host.strip() or config.bind_domain.encode("latin-1", "replace")
+    if _ILLEGAL_AUTHORITY_RE.search(name):
+        raise ValueError("the authority cannot be put in a header")
     if name.startswith(b"["):
         # An IPv6 literal keeps its brackets, only the port is dropped.
         end = name.find(b"]")
@@ -61,26 +69,32 @@ def _target_authority(config: ServerConfig, host: bytes, https_port: Optional[in
     return name + b":" + str(port).encode("ascii")
 
 
-def build_location(config: ServerConfig, target: bytes, host: bytes = b"", https_port: Optional[int] = None) -> Optional[bytes]:
+def build_location(config: ServerConfig, target: bytes, host: bytes = b"", https_port: int | None = None) -> bytes | None:
     """
     Return the absolute ``https://`` URL a request target is redirected to.
 
-    ``None`` means the target cannot be redirected, which the caller answers
-    with ``400``: only the origin form (``/path``) and the absolute form
-    (``http://host/path``) name a path that survives the switch to HTTPS.
-    ``https_port`` is the port the TLS listener is really bound to, which is
-    what the redirect uses when the configuration asked for an ephemeral one.
+    ``None`` means no redirect can be built, which the caller answers with
+    ``400``: only the origin form (``/path``) and the absolute form
+    (``http://host/path``) name a path that survives the switch to HTTPS, and
+    only an authority that can be written into a header (no space, no control
+    byte) can be redirected to.  ``https_port`` is the port the TLS listener is
+    really bound to, which is what the redirect uses when the configuration
+    asked for an ephemeral one.
     """
     if target.startswith(b"http://"):
         # Absolute form: only the scheme changes, the authority is already there.
-        return b"https://" + target[len(b"http://") :]
+        location = b"https://" + target[len(b"http://") :]
+        return None if _ILLEGAL_AUTHORITY_RE.search(location) else location
     if not target.startswith(b"/"):
         return None
     try:
         authority = _target_authority(config, host, https_port)
     except ValueError:
         return None
-    return b"https://" + authority + target
+    location = b"https://" + authority + target
+    if _ILLEGAL_AUTHORITY_RE.search(location):
+        return None
+    return location
 
 
 class RedirectProtocol(asyncio.Protocol):
@@ -93,17 +107,18 @@ class RedirectProtocol(asyncio.Protocol):
     everything else.
     """
 
-    def __init__(self, config: ServerConfig, connections: Set[Any], logger: logging.Logger, https_port: Optional[int] = None, on_release: Optional[Any] = None) -> None:
+    def __init__(self, config: ServerConfig, connections: set[object], logger: logging.Logger, https_port: int | None = None, on_release: object = None, rate_limiter: RateLimiter | None = None) -> None:
         self.config = config
         self.logger = logger
         self._connections = connections
         self._https_port = https_port
         self._on_release = on_release
+        self.rate_limiter = rate_limiter
         self._released = False
-        self.transport: Optional[asyncio.Transport] = None
-        self.peername: Any = None
+        self.transport: asyncio.Transport | None = None
+        self.peername: object = None
         self._buffer = bytearray()
-        self._timer: Optional[asyncio.TimerHandle] = None
+        self._timer: asyncio.TimerHandle | None = None
         self._answered = False
         self._closed = False
         self._connections.add(self)
@@ -140,7 +155,7 @@ class RedirectProtocol(asyncio.Protocol):
         self._close()
         return False
 
-    def connection_lost(self, exc: Optional[BaseException]) -> None:
+    def connection_lost(self, exc: BaseException | None) -> None:
         self._closed = True
         self._cancel_timer()
         self._release()
@@ -170,17 +185,34 @@ class RedirectProtocol(asyncio.Protocol):
             return
         method, target = match.group(1), match.group(2)
         if _ILLEGAL_TARGET_RE.search(target):
-            self._answer(400, reason="illegal character in request target")
+            self._answer(400, reason="illegal character in request target", method=method, target=target)
             return
+
+        if self.rate_limiter is not None:
+            client = client_key(self.peername)
+            wait = self.rate_limiter.check(client)
+            if wait is not None:
+                # The plaintext listener is the one an abusive client finds
+                # first, so it is rate limited like any other request, and the
+                # refusal is reported with the address that was limited.
+                seconds = retry_after_seconds(wait)
+                self._answer(
+                    429,
+                    reason="too many requests",
+                    retry_after=seconds,
+                    method=method,
+                    target=target,
+                )
+                return
 
         host = b""
         for line in lines[1:]:
             if line[:1] in (b" ", b"\t"):
-                self._answer(400, reason="obsolete line folding is not supported")
+                self._answer(400, reason="obsolete line folding is not supported", method=method, target=target)
                 return
             name, sep, value = line.partition(b":")
             if not sep:
-                self._answer(400, reason="malformed header field")
+                self._answer(400, reason="malformed header field", method=method, target=target)
                 return
             if name.strip().lower() == b"host":
                 host = value.strip()
@@ -188,17 +220,35 @@ class RedirectProtocol(asyncio.Protocol):
 
         location = build_location(self.config, target, host, self._https_port)
         if location is None:
-            self._answer(400, reason="request target cannot be redirected")
+            self._answer(
+                400,
+                reason="no redirect target can be built for this request",
+                method=method,
+                target=target,
+            )
             return
         self.logger.debug("Redirecting %s to %s", target, location)
-        self._answer(self.config.redirect_status, location=location, method=method)
+        self._answer(self.config.redirect_status, location=location, method=method, target=target)
 
-    def _answer(self, status: int, location: Optional[bytes] = None, reason: str = "", method: bytes = b"GET") -> None:
+    def _answer(self, status: int, location: bytes | None = None, reason: str = "", method: bytes = b"GET", retry_after: int | None = None, target: bytes = b"") -> None:
         """Write one response (a redirect or a refusal) and close the socket."""
         if self._answered:
             return
         self._answered = True
         self._cancel_timer()
+
+        if status >= 400:
+            # A refusal here never reaches the application, so the log is the
+            # only place the address and the reason can be seen.
+            utils.refusal_log(
+                self.logger,
+                "h11",
+                self.peername,
+                method.decode("latin-1", "replace") or None,
+                bytes(target).decode("latin-1", "replace"),
+                status,
+                reason,
+            )
 
         phrase = utils.status_phrase(status)
         lines = ["%d %s" % (status, phrase)]
@@ -223,6 +273,8 @@ class RedirectProtocol(asyncio.Protocol):
         ]
         if location is not None:
             parts.append(b"location: " + location + b"\r\n")
+        if retry_after is not None:
+            parts.append(b"retry-after: " + str(retry_after).encode("ascii") + b"\r\n")
         parts.append(b"connection: close\r\n\r\n")
         self._write(b"".join(parts) + (body if send_body else b""))
         self._close()

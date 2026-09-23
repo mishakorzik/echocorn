@@ -2,10 +2,10 @@
 Runtime configuration for the Echocorn ASGI server.
 
 The server is configured entirely by a TOML file, read with the standard
-library ``tomllib`` and pointed at by ``echocorn --config PATH``.  Settings are
+library ``tomllib`` and pointed at by ``echocorn --config PATH``. Settings are
 grouped into sections - ``[server]``, ``[http1]``, ``[http2]``,
-``[websocket]``, ``[logging]`` and ``[tls]`` - so each protocol can be turned
-on or off on its own.
+``[websocket]``, ``[ratelimit]``, ``[logging]`` and ``[tls]`` - so each
+protocol can be turned on or off on its own.
 
 Every key is validated while the file is loaded, so a typo or a wrong type is
 reported with the file name and the offending key instead of silently changing
@@ -18,9 +18,11 @@ import difflib
 import ipaddress
 import re
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, NamedTuple, Optional, Tuple
+
+from .ratelimit import MIN_SLOTS, effective_peak, slot_size
 
 __all__ = [
     "ServerConfig",
@@ -33,20 +35,20 @@ __all__ = [
 ]
 
 #: ``app`` names either an ASGI application (``module:attribute``) or a local
-#: server to proxy to (``127.0.0.1:5000``).  Only a loopback, private or
+#: server to proxy to (``127.0.0.1:5000``). Only a loopback, private or
 #: link-local host matches, so a configuration file can never point the server
 #: at a public machine and become an open proxy.
 _PROXY_TARGET_RE = re.compile(r"^(?P<host>\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+):(?P<port>[0-9]{1,5})$")
 
-#: Canonical log levels, most severe first.  These five names are the only ones
+#: Canonical log levels, most severe first. These five names are the only ones
 #: the server ever prints; ``WARNING`` and ``CRITICAL`` are accepted in the
 #: configuration file as aliases and stored under their short name.
 LOG_LEVELS = ("CRIT", "ERROR", "WARN", "INFO", "DEBUG")
 _LEVEL_ALIASES = {"WARNING": "WARN", "CRITICAL": "CRIT"}
 
-#: ``section -> key -> (kind, ServerConfig field)``.  This table is the single
+#: ``section -> key -> (kind, ServerConfig field)``. This table is the single
 #: source of truth for what the configuration file may contain.
-SCHEMA: Mapping[str, Mapping[str, Tuple[str, str]]] = {
+SCHEMA: Mapping[str, Mapping[str, tuple[str, str]]] = {
     "server": {
         "host": ("str", "host"),
         "port": ("int", "port"),
@@ -59,6 +61,7 @@ SCHEMA: Mapping[str, Mapping[str, Tuple[str, str]]] = {
         "max_header_size": ("int", "max_header_size"),
         "max_header_count": ("int", "max_header_count"),
         "max_request_size": ("int", "max_request_size"),
+        "max_response_size": ("int", "max_response_size"),
         "bind_domain": ("str", "bind_domain"),
         "compression": ("bool", "compression"),
         "safe_headers": ("bool", "safe_headers"),
@@ -77,6 +80,21 @@ SCHEMA: Mapping[str, Mapping[str, Tuple[str, str]]] = {
         "enabled": ("bool", "websockets"),
         "max_message_size": ("int", "max_websocket_message_size"),
     },
+    "redirect": {
+        "enabled": ("bool", "redirect_enabled"),
+        "host": ("str", "redirect_host"),
+        "port": ("int", "redirect_port"),
+        "status": ("int", "redirect_status"),
+    },
+    "ratelimit": {
+        "enabled": ("bool", "ratelimit_enabled"),
+        "requests": ("int", "ratelimit_requests"),
+        "peak": ("int", "ratelimit_peak"),
+        "window": ("float", "ratelimit_window"),
+        "ban": ("float", "ratelimit_ban"),
+        "shards": ("int", "ratelimit_shards"),
+        "cache_size": ("int", "ratelimit_cache_size"),
+    },
     "logging": {
         "level": ("level", "log_level"),
         "access": ("bool", "access_log"),
@@ -85,13 +103,7 @@ SCHEMA: Mapping[str, Mapping[str, Tuple[str, str]]] = {
     "tls": {
         "certfile": ("path", "certfile"),
         "keyfile": ("path", "keyfile"),
-    },
-    "redirect": {
-        "enabled": ("bool", "redirect_enabled"),
-        "host": ("str", "redirect_host"),
-        "port": ("int", "redirect_port"),
-        "status": ("int", "redirect_status"),
-    },
+    }
 }
 
 
@@ -99,7 +111,8 @@ class ConfigError(Exception):
     """The configuration file is missing, unreadable or invalid."""
 
 
-class Settings(NamedTuple):
+@dataclass(frozen=True, slots=True)
+class Settings:
     """A loaded configuration file: the settings, the app and where it came from."""
 
     config: ServerConfig
@@ -119,14 +132,14 @@ class ServerConfig:
     """
 
     # Application and binding.
-    app: Optional[Any] = None
+    app: object = None
     host: str = ""
     port: int = 8000
 
     # Process model.
     workers: int = 1
 
-    # Protocol switches.  Each protocol can be served on its own; the server
+    # Protocol switches. Each protocol can be served on its own; the server
     # advertises only what is enabled through ALPN.
     http1_enabled: bool = True
     """Serve HTTP/1.1 (RFC 9110, RFC 9112)."""
@@ -138,8 +151,8 @@ class ServerConfig:
     """Accept WebSocket upgrades (RFC 6455) over HTTP/1.1."""
 
     # TLS.
-    certfile: Optional[str] = None
-    keyfile: Optional[str] = None
+    certfile: str | None = None
+    keyfile: str | None = None
 
     # HTTP to HTTPS redirect. The redirect listener is a separate, plaintext
     # socket that answers every request with a redirect to the TLS origin; it
@@ -177,6 +190,9 @@ class ServerConfig:
     max_request_size: int = 0
     """Maximum request body size in bytes. 0 disables the limit."""
 
+    max_response_size: int = 0
+    """Maximum answer size in bytes the proxy relays from the upstream. 0 disables the limit."""
+
     max_websocket_message_size: int = 4 * 1024 * 1024
     """Maximum size of one WebSocket message, across all its fragments."""
 
@@ -185,6 +201,55 @@ class ServerConfig:
 
     backlog: int = 2048
     """listen(2) backlog for the listening socket."""
+
+    # Rate limiting. A client is the address its connection comes from: it may
+    # make ``ratelimit_requests`` requests per ``ratelimit_window`` seconds, one
+    # burst up to ``ratelimit_peak`` per window, and is refused with 429 for
+    # ``ratelimit_ban`` seconds once it goes past that. Every worker counts into
+    # one table in shared memory, so the allowance belongs to the server instead
+    # of being multiplied by the number of processes.
+    ratelimit_enabled: bool = False
+    """Answer over-limit requests with 429 Too Many Requests (RFC 6585)."""
+
+    ratelimit_requests: int = 10
+    """Requests one client may make per ``ratelimit_window`` seconds."""
+
+    ratelimit_peak: int = 12
+    """
+    How far a single burst inside one window may go. 0 means no burst.
+
+    It is handed out once per window, so it is a spike and never a second
+    allowance, and it sizes a slot: ``peak + 1`` timestamps are kept per client.
+    """
+
+    ratelimit_window: float = 7.0
+    """Length of the sliding window the allowance is counted over, in seconds."""
+
+    ratelimit_ban: float = 60.0
+    """How long an over-limit client is refused, in seconds. 0 disables it."""
+
+    ratelimit_shards: int = 64
+    """
+    Mutexes guarding the shared table, one per shard of it.
+
+    A request takes the mutex of its shard for the arithmetic on one slot.  More
+    shards mean fewer unrelated clients waiting for each other; a handful of
+    processes saturate well below 64, so the default is a good trade.
+    """
+
+    ratelimit_cache_size: int = 128
+    """
+    Megabytes of client counters, per server and not per worker.
+
+    With ``workers > 1`` this is the shared table: a slot holds one address and
+    is 46 bytes plus eight per request of the allowance, so the default of
+    128 MB keeps about 894 000 clients at the default ``peak`` of 12 and
+    proportionally fewer of a larger allowance.  A single worker uses it to
+    bound the clients it remembers in memory, at 256 bytes per client.
+
+    A full table does not refuse anybody: the request is counted in the worker
+    that could not place it, and ``SharedCounters.stats["overflow"]`` grows.
+    """
 
     # Timeouts in seconds.
     request_timeout: float = 10.0
@@ -265,12 +330,33 @@ class ServerConfig:
             raise ValueError("max_header_count must be positive")
         if self.max_request_size < 0:
             raise ValueError("max_request_size must not be negative")
+        if self.max_response_size < 0:
+            raise ValueError("max_response_size must not be negative")
         if self.max_websocket_message_size < 125:
             raise ValueError("max_websocket_message_size must be at least 125")
         if self.max_connections < 0:
             raise ValueError("max_connections must not be negative")
         if self.request_timeout < 0:
             raise ValueError("request_timeout must not be negative")
+        if self.ratelimit_requests < 1:
+            raise ValueError("ratelimit_requests must be positive")
+        if 0 < self.ratelimit_peak < self.ratelimit_requests:
+            raise ValueError("ratelimit_peak must be at least ratelimit_requests, or 0 for no burst")
+        if self.ratelimit_window <= 0:
+            raise ValueError("ratelimit_window must be positive")
+        if self.ratelimit_ban < 0:
+            raise ValueError("ratelimit_ban must not be negative")
+        if self.ratelimit_shards < 1:
+            raise ValueError("ratelimit_shards must be positive")
+        if self.ratelimit_cache_size < 1:
+            raise ValueError("ratelimit_cache_size must be at least one megabyte")
+        if self.ratelimit_enabled:
+            # A slot carries one timestamp per request of the allowance, so a
+            # huge peak in a tiny cache would ask for a gigabyte of memory: say
+            # so at startup instead of at the first request.
+            per_client = slot_size(effective_peak(self.ratelimit_requests, self.ratelimit_peak))
+            if self.ratelimit_cache_size * 1024 * 1024 < MIN_SLOTS * per_client:
+                raise ValueError("ratelimit_cache_size is too small for ratelimit_peak: %d clients need %d bytes" % (MIN_SLOTS, MIN_SLOTS * per_client))
         if not 0 <= self.redirect_port <= 65535:
             raise ValueError("redirect_port must be within 0..65535")
         if self.redirect_status not in (301, 302, 307, 308):
@@ -291,7 +377,7 @@ def _is_local(host: str) -> bool:
 
     ``localhost`` and every private, loopback or link-local address counts
     (``127.0.0.0/8``, ``10.0.0.0/8``, ``172.16.0.0/12``, ``192.168.0.0/16``,
-    ``169.254.0.0/16``, ``::1``, ``fc00::/7``, ``fe80::/10``).  A public
+    ``169.254.0.0/16``, ``::1``, ``fc00::/7``, ``fe80::/10``). A public
     address, and a name that is not an address at all, does not: a
     configuration file must not be able to turn the server into an open proxy.
     """
@@ -304,16 +390,16 @@ def _is_local(host: str) -> bool:
     return address.is_private or address.is_loopback or address.is_link_local
 
 
-def proxy_target(value: str) -> Optional[Tuple[str, int]]:
+def proxy_target(value: str) -> tuple[str, int] | None:
     """
     Return ``(host, port)`` when ``app`` names a local server to proxy to.
 
     ``app = "127.0.0.1:5000"`` puts the server in front of a program that is
     already listening somewhere on this machine or on a local network - loopback
-    like ``::1``, or a private address like ``192.168.0.105:5000``.  Only such a
+    like ``::1``, or a private address like ``192.168.0.105:5000``. Only such a
     local address is accepted: a configuration file must not be able to turn the
     server into an open proxy, so anything else has to name an ASGI application
-    as ``module:attribute``.  ``None`` means the value is not a ``host:port``
+    as ``module:attribute``. ``None`` means the value is not a ``host:port``
     pair at all; a malformed or non-local one raises :class:`ValueError`.
     """
     match = _PROXY_TARGET_RE.match(value.strip())
@@ -322,17 +408,14 @@ def proxy_target(value: str) -> Optional[Tuple[str, int]]:
     host = match.group("host")
     bare = host[1:-1] if host.startswith("[") else host
     if not _is_local(bare):
-        raise ValueError(
-            "only a local address (loopback or a private network) can be proxied, not %r"
-            % bare
-        )
+        raise ValueError("only a local address (loopback or a private network) can be proxied, not %r" % bare)
     port = int(match.group("port"))
     if not 1 <= port <= 65535:
         raise ValueError("the proxied port must be within 1..65535")
     return bare, port
 
 
-def _suggest(name: str, section: Optional[str] = None) -> str:
+def _suggest(name: str, section: str | None = None) -> str:
     """
     Return a short "did you mean" hint for an unknown key.
 
@@ -341,18 +424,14 @@ def _suggest(name: str, section: Optional[str] = None) -> str:
     rather than left to guess), and finally among the section names.
     """
     if section is not None:
-        matches = difflib.get_close_matches(
-            name, list(SCHEMA[section]), n=3, cutoff=0.6
-        )
+        matches = difflib.get_close_matches(name, list(SCHEMA[section]), n=3, cutoff=0.6)
         if matches:
             return "; did you mean %s?" % ", ".join(matches)
 
     for candidate, keys in SCHEMA.items():
         hits = difflib.get_close_matches(name, list(keys), n=3, cutoff=0.6)
         if hits:
-            return "; did you mean %s?" % ", ".join(
-                "%s.%s" % (candidate, key) for key in hits
-            )
+            return "; did you mean %s?" % ", ".join("%s.%s" % (candidate, key) for key in hits)
 
     sections = difflib.get_close_matches(name, list(SCHEMA), n=3, cutoff=0.6)
     if sections:
@@ -360,7 +439,7 @@ def _suggest(name: str, section: Optional[str] = None) -> str:
     return ""
 
 
-def _check(name: str, kind: str, value: Any, source: Path) -> Any:
+def _check(name: str, kind: str, value: object, source: Path) -> object:
     """Validate one value, returning the value to store in the config."""
 
     def reject(expected: str) -> "ConfigError":
@@ -401,10 +480,10 @@ def _check(name: str, kind: str, value: Any, source: Path) -> Any:
     return value
 
 
-def _settings_from_mapping(data: Dict[str, Any], source: Path) -> Settings:
+def _settings_from_mapping(data: dict[str, object], source: Path) -> Settings:
     """Turn a parsed TOML document into validated settings."""
-    values: Dict[str, Any] = {}
-    app: Optional[Any] = None
+    values: dict[str, object] = {}
+    app: object = None
 
     for name, section in data.items():
         if name == "app":
@@ -434,10 +513,7 @@ def _settings_from_mapping(data: Dict[str, Any], source: Path) -> Settings:
     if target is None:
         module_name, _, attribute = app.partition(":")
         if not module_name or not attribute:
-            raise ConfigError(
-                "%s: app must name an ASGI application as \"module:callable\" or a "
-                "local server to proxy to as \"host:port\" (127.0.0.1:5000)" % source
-            )
+            raise ConfigError("%s: app must name an ASGI application as \"module:callable\" or a local server to proxy to as \"host:port\" (127.0.0.1:5000)" % source)
 
     if bool(values.get("certfile")) != bool(values.get("keyfile")):
         raise ConfigError("%s: tls.certfile and tls.keyfile must be set together or left out together" % source)
@@ -449,7 +525,7 @@ def _settings_from_mapping(data: Dict[str, Any], source: Path) -> Settings:
     return Settings(config=config, app=app, path=source)
 
 
-def load_settings(path: Any) -> Settings:
+def load_settings(path: object) -> Settings:
     """
     Read, parse and validate the configuration file at ``path``.
 
@@ -473,6 +549,6 @@ def load_settings(path: Any) -> Settings:
     except OSError as exc:
         raise ConfigError("cannot read %s: %s" % (source, exc)) from None
 
-    if not isinstance(data, dict):  # pragma: no cover - tomllib always returns a dict
+    if not isinstance(data, dict):
         raise ConfigError("%s: the configuration must be a table of settings" % source)
     return _settings_from_mapping(data, source)

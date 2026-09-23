@@ -11,6 +11,7 @@ regression tests for the flow-control bug in the original implementation:
 from __future__ import annotations
 
 import gzip
+import zlib
 
 from conftest import H2Client, ServerThread
 
@@ -240,6 +241,40 @@ def test_compression_over_http2(compression_server: ServerThread):
         assert gzip.decompress(bytes(response.body)) == b"compression test payload " * 200
 
 
+def test_deflate_over_http2_uses_the_zlib_wrapper(compression_server: ServerThread):
+    with H2Client(compression_server) as client:
+        stream_id = client.request(
+            "/compressible", headers=[(b"accept-encoding", b"deflate")]
+        )
+        response = client.wait(stream_id)
+        assert response.status == 200
+        assert response.header(b"content-encoding") == b"deflate"
+        assert zlib.decompress(bytes(response.body)) == b"compression test payload " * 200
+
+
+def test_negotiated_http2_response_says_vary(compression_server: ServerThread):
+    """The coding is negotiated from the request, so a cache has to know."""
+    with H2Client(compression_server) as client:
+        stream_id = client.request(
+            "/compressible", headers=[(b"accept-encoding", b"gzip")]
+        )
+        response = client.wait(stream_id)
+        assert response.header(b"content-encoding") == b"gzip"
+        assert response.header(b"vary") == b"Accept-Encoding"
+
+
+def test_http2_vary_is_sent_even_when_every_coding_is_refused(
+    compression_server: ServerThread,
+):
+    with H2Client(compression_server) as client:
+        stream_id = client.request(
+            "/compressible", headers=[(b"accept-encoding", b"gzip;q=0, deflate;q=0")]
+        )
+        response = client.wait(stream_id)
+        assert response.header(b"content-encoding") is None
+        assert response.header(b"vary") == b"Accept-Encoding"
+
+
 def test_compression_skipped_when_not_accepted(compression_server: ServerThread):
     with H2Client(compression_server) as client:
         stream_id = client.request(
@@ -257,6 +292,15 @@ def test_compression_disabled_without_flag(server: ServerThread):
         )
         response = client.wait(stream_id)
         assert response.header(b"content-encoding") is None
+
+
+# Response bodies an application hands over as a buffer
+def test_buffered_response_bodies_are_framed(server: ServerThread):
+    with H2Client(server) as client:
+        for path in ("/bytearray-body", "/memoryview-body"):
+            response = client.wait(client.request(path))
+            assert response.status == 200, path
+            assert bytes(response.body) == b"buffered body " * 200, path
 
 
 # Misc

@@ -3,15 +3,15 @@
 Why this module looks the way it does
 -------------------------------------
 ``h2`` is a synchronous state machine that must be driven from exactly one
-place at a time.  Two rules are therefore enforced here:
+place at a time. Two rules are therefore enforced here:
 
 1. **All** ``h2`` calls happen on the event loop thread and never interleave
-   with an ``await`` in the middle of a state transition.  ``data_received``
+   with an ``await`` in the middle of a state transition. ``data_received``
    feeds the connection and dispatches every event synchronously, in order.
-2. Outbound DATA respects the peer's flow control window.  ``h2.send_data``
+2. Outbound DATA respects the peer's flow control window. ``h2.send_data``
    raises :class:`h2.exceptions.FlowControlError` if more than
    ``local_flow_control_window()`` bytes are pushed, so the writer waits for
-   ``WindowUpdated`` events before continuing.  This is the main reason the
+   ``WindowUpdated`` events before continuing. This is the main reason the
    previous implementation failed on responses larger than 64 KiB.
 
 Inbound DATA is acknowledged lazily, when the application actually reads it.
@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from collections.abc import Callable
 
 import h2.config
 import h2.connection
@@ -36,6 +36,7 @@ import h2.settings
 from . import utils
 from .config import ServerConfig
 from .http1 import CONNECTION_PREFACE
+from .ratelimit import RateLimiter, client_key, retry_after_seconds
 from .utils import ASGIRequest, Compressor, Headers
 
 __all__ = ["HTTP2Handler", "CONNECTION_PREFACE"]
@@ -62,9 +63,9 @@ class _H2Stream:
         self.closed = False
         self.request_ended = False
         self.response_complete = False
-        self.writer_task: Optional[asyncio.Task] = None
+        self.writer_task: asyncio.Task | None = None
         self.unacked = 0
-        self.deadline: Optional[float] = None
+        self.deadline: float | None = None
         self.received = 0
 
 
@@ -76,11 +77,12 @@ class HTTP2Handler:
         app: Callable,
         config: ServerConfig,
         transport: asyncio.Transport,
-        peername: Any,
-        server_addr: Any,
-        ssl_object: Any,
+        peername: object,
+        server_addr: object,
+        ssl_object: object,
         logger: logging.Logger,
-        on_close: Optional[Callable[[], None]] = None,
+        on_close: Callable[[], None] | None = None,
+        rate_limiter: RateLimiter | None = None,
     ) -> None:
         self.app = app
         self.config = config
@@ -91,6 +93,7 @@ class HTTP2Handler:
         self.logger = logger
         self.access_logger = logging.getLogger("echocorn.access")
         self._on_close = on_close
+        self.rate_limiter = rate_limiter
 
         self.conn = h2.connection.H2Connection(
             config=h2.config.H2Configuration(
@@ -104,7 +107,7 @@ class HTTP2Handler:
         )
         self.conn.decoder.max_header_list_size = config.h2_max_header_list_size
 
-        self.streams: Dict[int, _H2Stream] = {}
+        self.streams: dict[int, _H2Stream] = {}
         self._closed = False
         self._window_event = asyncio.Event()
         self._write_paused = False
@@ -115,7 +118,7 @@ class HTTP2Handler:
         self._requests_completed = 0
         self._streams_opened = 0
         self._goaway_received = False
-        self._watchdog_task: Optional[asyncio.Task] = None
+        self._watchdog_task: asyncio.Task | None = None
 
     # asyncio protocol callbacks.
     def connection_made(self) -> None:
@@ -166,7 +169,7 @@ class HTTP2Handler:
         self._write_paused = False
         self._resume_event.set()
 
-    def connection_lost(self, exc: Optional[BaseException]) -> None:
+    def connection_lost(self, exc: BaseException | None) -> None:
         self._closed = True
         for stream in list(self.streams.values()):
             stream.request.notify_disconnect()
@@ -236,20 +239,12 @@ class HTTP2Handler:
                     if deadline is not None and now >= deadline:
                         self._reset_stream(stream, h2.errors.ErrorCodes.CANCEL, "request not completed in time")
 
-                if (
-                    not self.streams
-                    and keep_alive > 0
-                    and now - self._last_activity > keep_alive
-                ):
+                if (not self.streams and keep_alive > 0 and now - self._last_activity > keep_alive):
                     self.logger.debug("closing idle h20 connection after %.1fs", keep_alive)
                     self.shutdown()
                     return
 
-                if (
-                    not self._streams_opened
-                    and request_timeout > 0
-                    and now - self._connected_at > request_timeout
-                ):
+                if (not self._streams_opened and request_timeout > 0 and now - self._connected_at > request_timeout):
                     # The connection never produced a single stream: a peer that
                     # holds it open without ever starting a request is dropped.
                     # Once a stream exists, its own deadline is what governs,
@@ -272,14 +267,10 @@ class HTTP2Handler:
         now = time.monotonic()
         request_timeout = self.config.request_timeout
         keep_alive = self.config.keep_alive_timeout
-        deadlines: List[float] = []
+        deadlines: list[float] = []
 
         if self.streams:
-            deadlines = [
-                stream.deadline - now
-                for stream in self.streams.values()
-                if stream.deadline is not None
-            ]
+            deadlines = [stream.deadline - now for stream in self.streams.values() if stream.deadline is not None]
             if not deadlines:
                 # Streams without a deadline (request_timeout disabled) still
                 # have to be re-checked soon, so that finishing them brings the
@@ -364,7 +355,7 @@ class HTTP2Handler:
         self._flush()
 
     # event dispatch
-    def _handle_event(self, event: Any) -> None:
+    def _handle_event(self, event: object) -> None:
         try:
             if isinstance(event, h2.events.RequestReceived):
                 self._on_request(event)
@@ -385,7 +376,7 @@ class HTTP2Handler:
         except Exception:
             self.logger.exception("error while handling h20 event %r", event)
 
-    def _on_connection_terminated(self, event: Any) -> None:
+    def _on_connection_terminated(self, event: object) -> None:
         """
         Handle the peer's GOAWAY frame (RFC 9113 section 6.8).
 
@@ -394,7 +385,7 @@ class HTTP2Handler:
         as soon as nothing is in flight, so a peer that sends GOAWAY and keeps
         the connection open cannot leak a file descriptor.
         """
-        self.logger.info("h20 peer sent GOAWAY (last=%s, error=%s)", event.last_stream_id, event.error_code)
+        self.logger.debug("h20 peer sent GOAWAY (last=%s, error=%s)", event.last_stream_id, event.error_code)
         self._goaway_received = True
         if event.error_code != h2.errors.ErrorCodes.NO_ERROR:
             self._close()
@@ -405,7 +396,7 @@ class HTTP2Handler:
         if not self.streams:
             self._close()
 
-    def _on_request(self, event: Any) -> None:
+    def _on_request(self, event: object) -> None:
         stream_id = event.stream_id
         if stream_id in self.streams:
             self._rst(stream_id, h2.errors.ErrorCodes.PROTOCOL_ERROR)
@@ -413,7 +404,7 @@ class HTTP2Handler:
 
         # h2 has already enforced the pseudo-header rules (ordering, duplicates
         # and the :authority/Host match) while decoding the frame.
-        pseudo: Dict[bytes, bytes] = {}
+        pseudo: dict[bytes, bytes] = {}
         regular: Headers = []
         for name, value in event.headers:
             if name.startswith(b":"):
@@ -425,13 +416,27 @@ class HTTP2Handler:
         path = pseudo.get(b":path", b"")
         scheme = pseudo.get(b":scheme", b"")
         authority = pseudo.get(b":authority") or utils.get_header(regular, b"host") or b""
+        if authority and not utils.valid_authority(authority):
+            # The same rule as the HTTP/1.1 ``Host`` field (RFC 9112 section 3.2):
+            # an authority that is not an authority is refused here rather than
+            # handed to whatever routes, caches or logs on it.
+            self._respond_simple(stream_id, 400, b"Invalid :authority", method=pseudo.get(b":method", b"").upper(), target=pseudo.get(b":path", b"").decode("latin-1", "replace"))
+            return
+        if authority:
+            # HTTP/2 has no ``Host`` field, but the scope must: the ASGI spec
+            # (www 2.5) requires the authority to be carried as a ``host``
+            # header, first in the list, replacing any that was sent.  Without
+            # it a framework, its logs and the proxy behind it see no host at
+            # all for an HTTP/2 request.
+            regular = [(b"host", authority)] + [(name, value) for name, value in regular if name != b"host"]
 
         # The method is known by now, so even these replies stay HEAD safe.
+        target = path.decode("latin-1", "replace")
         if len(event.headers) > self.config.max_header_count:
-            self._respond_simple(stream_id, 431, b"Too many header fields", method=method)
+            self._respond_simple(stream_id, 431, b"Too many header fields", method=method, target=target)
             return
         if not method:
-            self._respond_simple(stream_id, 400, b"Missing :method pseudo-header")
+            self._respond_simple(stream_id, 400, b"Missing :method pseudo-header", target=target)
             return
         if method not in ALLOWED_METHODS:
             allow = b", ".join(sorted(ALLOWED_METHODS))
@@ -441,32 +446,50 @@ class HTTP2Handler:
                 b"Method Not Allowed",
                 extra=[(b"allow", allow)],
                 method=method,
+                target=target,
             )
             return
         if not path:
             self._respond_simple(stream_id, 400, b"Missing :path pseudo-header", method=method)
             return
         if path != b"*" and not path.startswith(b"/"):
-            self._respond_simple(stream_id, 400, b"Invalid :path pseudo-header", method=method)
+            self._respond_simple(stream_id, 400, b"Invalid :path pseudo-header", method=method, target=target)
             return
         if len(path) > utils.MAX_TARGET_LENGTH:
-            self._respond_simple(stream_id, 414, b"URI Too Long", method=method)
+            self._respond_simple(stream_id, 414, b"URI Too Long", method=method, target=target)
             return
         if not scheme:
-            self._respond_simple(stream_id, 400, b"Missing :scheme pseudo-header", method=method)
+            self._respond_simple(stream_id, 400, b"Missing :scheme pseudo-header", method=method, target=target)
             return
 
         if self.config.bind_domain:
-            if utils.authority_host(authority) != utils.authority_host(
-                self.config.bind_domain.encode("latin-1", "replace")
-            ):
-                self._respond_simple(stream_id, 421, b"Misdirected Request", method=method)
+            if utils.authority_host(authority) != utils.authority_host(self.config.bind_domain.encode("latin-1", "replace")):
+                self._respond_simple(stream_id, 421, b"Misdirected Request", method=method, target=target)
+                return
+
+        if self.rate_limiter is not None:
+            client = client_key(self.peername)
+            wait = self.rate_limiter.check(client)
+            if wait is not None:
+                seconds = retry_after_seconds(wait)
+                # A stream of its own is refused: the connection stays usable,
+                # and the client sees the reason without losing its other
+                # streams (RFC 6585 section 4). ``_respond_simple`` warns about
+                # it, naming the address that was limited.
+                self._respond_simple(
+                    stream_id,
+                    429,
+                    b"Too Many Requests\n",
+                    extra=[(b"retry-after", str(seconds).encode("ascii"))],
+                    method=method,
+                    target=target,
+                )
                 return
 
         raw_path, _, query = path.partition(b"?")
         decoded_path = utils.decode_path(raw_path)
 
-        scope: Dict[str, Any] = {
+        scope: dict[str, object] = {
             "type": "http",
             "asgi": {"version": "3.0", "spec_version": "2.3"},
             "http_version": "2",
@@ -496,7 +519,7 @@ class HTTP2Handler:
         request.app_task = asyncio.ensure_future(request.run_app(self.app))
         stream.writer_task = asyncio.ensure_future(self._write_response(stream))
 
-    def _on_data(self, event: Any) -> None:
+    def _on_data(self, event: object) -> None:
         stream = self.streams.get(event.stream_id)
         flow_size = event.flow_controlled_length
         if stream is None or stream.closed:
@@ -516,7 +539,13 @@ class HTTP2Handler:
             # reason, then reset the stream to stop the upload. h2 only emits
             # RST_STREAM while the stream is still open, which is correct.
             stream.request.keep_alive = False
-            self._respond_simple(event.stream_id, 413, b"Payload Too Large")
+            self._respond_simple(
+                event.stream_id,
+                413,
+                b"Payload Too Large",
+                method=stream.request.scope["method"].encode("latin-1", "replace"),
+                target=stream.request.target,
+            )
             self._reset_stream(stream, h2.errors.ErrorCodes.CANCEL, "request body too large")
             return
         stream.received += len(event.data)
@@ -590,7 +619,7 @@ class HTTP2Handler:
             self._close()
 
     # response writing
-    def _send_headers(self, stream_id: int, headers: List[Tuple[bytes, bytes]], end_stream: bool) -> bool:
+    def _send_headers(self, stream_id: int, headers: list[tuple[bytes, bytes]], end_stream: bool) -> bool:
         if self._closed:
             return False
         if not headers:
@@ -639,43 +668,58 @@ class HTTP2Handler:
             if end_stream:
                 self._end_stream(stream.stream_id)
             return True
-        view = memoryview(data)
+
         offset = 0
-        total = len(view)
+        total = len(data)
         while offset < total:
             if self._closed or stream.closed:
                 return False
+
             try:
                 window = self.conn.local_flow_control_window(stream.stream_id)
             except (h2.exceptions.StreamClosedError, KeyError):
                 return False
             except h2.exceptions.H2Error:
                 return False
+
             if window <= 0:
                 if not await self._wait_for_window(stream):
                     return False
                 continue
+
             chunk_size = min(window, self.conn.max_outbound_frame_size, total - offset)
-            chunk = bytes(view[offset : offset + chunk_size])
+            chunk = data[offset : offset + chunk_size]
             offset += chunk_size
             try:
                 self.conn.send_data(stream.stream_id, chunk, end_stream=end_stream and offset >= total)
             except h2.exceptions.H2Error as exc:
-                self.logger.warning("Cannot send data on stream %d: %s", stream.stream_id, exc)
+                self.logger.warning("cannot send data on stream %d: %s", stream.stream_id, exc)
                 return False
+
             await self._wait_writable()
             self._flush()
             self._note_progress(stream.stream_id)
         return True
 
-    def _respond_simple(self, stream_id: int, status: int, body: bytes = b"", extra: Optional[List[Tuple[bytes, bytes]]] = None, method: bytes = b"") -> None:
+    def _respond_simple(self, stream_id: int, status: int, body: bytes = b"", extra: list[tuple[bytes, bytes]] | None = None, method: bytes = b"", target: str = "") -> None:
         """
         Answer a request that never reached the application.
 
         The bodies here are a single short line, so they always fit in the
         initial flow-control window and are sent without an extra window check.
+        Because the application never sees these requests, they are reported at
+        WARN with the address they came from.
         """
-        headers: List[Tuple[bytes, bytes]] = [
+        utils.refusal_log(
+            self.logger,
+            "h20",
+            self.peername,
+            method.decode("latin-1", "replace") or None,
+            target,
+            status,
+            body.decode("latin-1", "replace").strip() or utils.status_phrase(status),
+        )
+        headers: list[tuple[bytes, bytes]] = [
             (b":status", str(status).encode("latin-1")),
             (b"content-type", b"text/plain; charset=utf-8"),
             (b"content-length", str(len(body)).encode("latin-1")),
@@ -701,8 +745,9 @@ class HTTP2Handler:
         stream_id = stream.stream_id
         try:
             headers: Headers = []
-            compressor: Optional[Compressor] = None
+            compressor: Compressor | None = None
             started = False
+            aborted = False
             trailers_expected = False
             awaiting_trailers = False
             discard_body = False
@@ -717,53 +762,34 @@ class HTTP2Handler:
                 if message_type == "http.response.start":
                     raw_status = int(message["status"])
                     if raw_status < 200:
-                        interim = utils.normalize_response_headers(
-                            message.get("headers"),
-                            lowercase=True,
-                            forbidden=utils.H2_FORBIDDEN_HEADERS,
-                        )
-                        self._send_headers(
-                            stream_id,
-                            [(b":status", str(raw_status).encode("latin-1")), *interim],
-                            end_stream=False,
-                        )
+                        interim = utils.normalize_response_headers(message.get("headers"), lowercase=True, forbidden=utils.H2_FORBIDDEN_HEADERS)
+                        self._send_headers(stream_id, [(b":status", str(raw_status).encode("latin-1")), *interim], end_stream=False)
                         continue
 
                     status = raw_status
                     request.status = status
-                    headers = utils.normalize_response_headers(
-                        message.get("headers"),
-                        lowercase=True,
-                        forbidden=utils.H2_FORBIDDEN_HEADERS,
-                    )
+                    headers = utils.normalize_response_headers(message.get("headers"), lowercase=True, forbidden=utils.H2_FORBIDDEN_HEADERS)
                     has_body = utils.response_has_body(request.scope["method"], status)
                     trailers_expected = bool(message.get("trailers")) and has_body
 
                     if has_body and self.config.compression:
-                        encoding = utils.should_compress(
-                            request.scope["method"],
-                            status,
-                            headers,
-                            request.scope["headers"],
-                        )
+                        if utils.compressible_response(request.scope["method"], status, headers):
+                            # A ``Vary`` is required whatever the client asked
+                            # for: without it a shared cache could replay the
+                            # compressed body to a client that cannot decode it
+                            # (RFC 9110 section 12.5.5).
+                            headers = utils.add_vary(headers)
+                        encoding = utils.should_compress(request.scope["method"], status, headers, request.scope["headers"])
                         if encoding is not None:
                             compressor = Compressor(encoding)
-                            headers = [
-                                (name, value)
-                                for name, value in headers
-                                if name.lower() != b"content-length"
-                            ]
+                            headers = [(name, value) for name, value in headers if name.lower() != b"content-length"]
                             headers.append((b"content-encoding", encoding.encode("latin-1")))
 
                     if not has_body:
                         drop = utils.bodyless_header_drops(request.scope["method"], status)
-                        headers = [
-                            (name, value)
-                            for name, value in headers
-                            if name.lower() not in drop
-                        ]
+                        headers = [(name, value) for name, value in headers if name.lower() not in drop]
 
-                    response_headers: List[Tuple[bytes, bytes]] = [(b":status", str(status).encode("latin-1"))]
+                    response_headers: list[tuple[bytes, bytes]] = [(b":status", str(status).encode("latin-1"))]
                     if not utils.has_header(headers, b"date"):
                         response_headers.append((b"date", utils.format_http_date().encode("latin-1")))
                     if not utils.has_header(headers, b"server"):
@@ -799,6 +825,13 @@ class HTTP2Handler:
                         if not more:
                             break
                         continue
+                    if not more and message.get("aborted"):
+                        # The application gave up on an answer it had already
+                        # started (see utils.ResponseAborted): the stream is
+                        # reset rather than ended, because a truncated body that
+                        # ends with END_STREAM would look complete.
+                        aborted = True
+                        break
                     # END_STREAM has to travel with the trailer block when the
                     # application announced trailers (RFC 9113 section 8.1).
                     ends_here = not more and not trailers_expected
@@ -829,11 +862,7 @@ class HTTP2Handler:
                         if not message.get("more_trailers"):
                             break
                         continue
-                    trailer_headers = utils.normalize_response_headers(
-                        message.get("headers"),
-                        lowercase=True,
-                        forbidden=utils.H2_FORBIDDEN_HEADERS,
-                    )
+                    trailer_headers = utils.normalize_response_headers(message.get("headers"), lowercase=True, forbidden=utils.H2_FORBIDDEN_HEADERS)
                     more_trailers = bool(message.get("more_trailers"))
                     if not self._send_headers(stream_id, trailer_headers, end_stream=not more_trailers):
                         return
@@ -841,6 +870,10 @@ class HTTP2Handler:
                         break
 
             request.bytes_sent = byte_count
+            if aborted:
+                self.logger.warning("abandoning h20 stream %d: the application could not finish the response", stream_id)
+                self._reset_stream(stream, h2.errors.ErrorCodes.INTERNAL_ERROR, "response abandoned")
+                return
         except asyncio.CancelledError:
             raise
         except Exception:

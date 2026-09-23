@@ -246,6 +246,65 @@ def test_access_lines_are_not_built_when_the_level_filters_them_out(
     assert capsys.readouterr().err == ""
 
 
+# Refusals the application never sees: the operator learns about them here
+def test_a_refusal_line_has_the_documented_shape(logs, capsys):
+    utils.refusal_log(
+        logger, "h11", ("127.0.0.1", 51000), "GET", "/x", 421, "misdirected request"
+    )
+    (line,) = printed(capsys)
+    assert "WARN" in line
+    assert line.endswith(
+        "h11, ip=127.0.0.1, method=GET, path=/x, code=421, reason=misdirected request"
+    )
+
+
+def test_a_refusal_line_without_a_reason_or_a_peer(logs, capsys):
+    utils.refusal_log(logger, "h20", None, None, "/a\r\nb\x00c", 400)
+    assert messages(capsys) == ["h20, ip=-, path=/a\\x0d\\x0ab\\x00c, code=400"]
+
+
+def test_refusals_are_not_built_when_the_level_filters_them_out(muted_logs, capsys):
+    utils.refusal_log(logger, "h11", ("127.0.0.1", 1), "GET", "/", 429, "too many requests")
+    assert capsys.readouterr().err == ""
+
+
+def test_a_misdirected_request_is_reported_with_the_address(logs, capsys):
+    with ServerThread(bind_domain="example.com") as server:
+        connection = server.connect()
+        try:
+            connection.sendall(build_request(target="/", host="other.example"))
+            response = read_response(connection)
+        finally:
+            connection.close()
+    assert response.status == 421
+    output = wait_for(capsys, "code=421")
+    assert "code=421, reason=misdirected request" in output
+    assert "ip=127.0.0.1" in output
+
+
+def test_a_rate_limited_client_is_reported_with_the_address(logs, capsys):
+    with ServerThread(
+        ratelimit_enabled=True,
+        ratelimit_requests=1,
+        ratelimit_peak=0,
+        ratelimit_ban=30.0,
+    ) as server:
+        assert _get(server).status == 200
+        assert _get(server).status == 429
+    output = wait_for(capsys, "code=429")
+    assert "code=429, reason=too many requests" in output
+    assert "ip=127.0.0.1" in output
+
+
+def _get(server: ServerThread):
+    connection = server.connect()
+    try:
+        connection.sendall(build_request(target="/", host="localhost"))
+        return read_response(connection)
+    finally:
+        connection.close()
+
+
 @pytest.mark.parametrize(
     "address, expected",
     [

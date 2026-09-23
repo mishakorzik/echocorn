@@ -135,6 +135,63 @@ def test_trickled_bytes_do_not_extend_the_deadline():
             sock.close()
 
 
+def test_a_keep_alive_request_gets_its_own_window():
+    """The idle wait must not be charged to the request that follows it."""
+    with ServerThread(request_timeout=1.0) as server:
+        sock = server.connect(timeout=5.0)
+        try:
+            sock.sendall(build_request(host="localhost"))
+            assert read_response(sock).status == 200
+            # Most of a window was spent idle; the next request is answered
+            # after the old deadline would have passed, and must still arrive.
+            time.sleep(0.8)
+            sock.sendall(build_request(target="/slow-start?delay=0.5", host="localhost"))
+            assert read_response(sock).body == b"late"
+        finally:
+            sock.close()
+
+
+def test_a_crash_in_the_middle_of_a_response_is_not_framed_as_whole():
+    """A body that stops halfway must not borrow a chunk terminator."""
+    with ServerThread() as server:
+        sock = server.connect(timeout=5.0)
+        try:
+            sock.sendall(build_request(target="/crash-mid-body", host="localhost"))
+            raw = b""
+            while True:
+                try:
+                    data = sock.recv(65536)
+                except OSError:
+                    break
+                if not data:
+                    break
+                raw += data
+        finally:
+            sock.close()
+    assert raw.startswith(b"HTTP/1.1 200")
+    assert b"half" in raw
+    # The connection is dropped instead: no zero-length chunk, no terminator.
+    assert not raw.endswith(b"0\r\n\r\n")
+
+
+def test_h2_crash_in_the_middle_of_a_response_is_a_stream_reset():
+    with ServerThread() as server:
+        with H2Client(server) as client:
+            stream_id = client.request("/crash-mid-body")
+
+            def reset_seen() -> bool:
+                response = client.responses.get(stream_id)
+                return response is not None and response.reset is not None
+
+            client._pump(reset_seen, timeout=6.0)
+            response = client.responses[stream_id]
+            assert response.status == 200
+            assert bytes(response.body) == b"half"
+            assert response.reset is not None
+            # The connection is unaffected: a later stream is served normally.
+            assert client.wait(client.request("/"), timeout=6.0).status == 200
+
+
 def test_slow_but_valid_request_is_served():
     with ServerThread(request_timeout=2.0) as server:
         sock = server.connect(timeout=5.0)
@@ -477,3 +534,35 @@ def test_struct_linger_is_available():  # noqa: D401 - documents an assumption
     """The reset path depends on SO_LINGER; make the assumption explicit."""
     assert hasattr(socket, "SO_LINGER")
     assert len(struct.pack("ii", 1, 0)) == 8
+
+
+def test_the_whole_server_is_built_on_asyncio_protocols():  # noqa: D401 - documents an assumption
+    """Every connection is an ``asyncio.Protocol``, never a stream pair.
+
+    The stream layer would add a task and its own buffer per connection, expose
+    neither the write watermarks nor ``pause_reading`` - which is where the
+    backpressure here comes from - and hide the transport the reset path needs.
+    The check is on the source, so a stream fallback added later cannot slip in
+    unnoticed: a protocol subclass is there, and the stream API is nowhere.
+    """
+    import ast
+    import asyncio
+    import inspect
+
+    from echocorn import http1, http2, proxy, ratelimit, redirect, server, utils, websocket
+
+    assert issubclass(server.ConnectionProtocol, asyncio.Protocol)
+    assert issubclass(proxy.UpstreamConnection, asyncio.Protocol)
+    assert issubclass(redirect.RedirectProtocol, asyncio.Protocol)
+
+    # The calls and names that only the stream layer, a worker thread or a
+    # blocking helper would need. The tree is walked rather than the text, so a
+    # docstring may still explain why one of them is not used.
+    banned_attributes = {"open_connection", "start_server", "readuntil", "readexactly", "run_in_executor", "to_thread"}
+    banned_names = {"StreamReader", "StreamWriter"}
+    for module in (http1, http2, proxy, ratelimit, redirect, server, utils, websocket):
+        for node in ast.walk(ast.parse(inspect.getsource(module))):
+            if isinstance(node, ast.Attribute):
+                assert node.attr not in banned_attributes, "%s calls %s" % (module.__name__, node.attr)
+            elif isinstance(node, ast.Name):
+                assert node.id not in banned_names, "%s uses %s" % (module.__name__, node.id)

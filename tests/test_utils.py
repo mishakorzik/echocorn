@@ -163,6 +163,38 @@ def test_should_compress_rules():
     )
 
 
+def test_compressible_response_is_what_the_response_alone_decides():
+    plain = [(b"content-type", b"text/plain"), (b"content-length", b"2048")]
+    assert utils.compressible_response("GET", 200, plain)
+    assert not utils.compressible_response("HEAD", 200, plain)
+    assert not utils.compressible_response("GET", 304, plain)
+    assert not utils.compressible_response("GET", 206, plain)
+    assert not utils.compressible_response(
+        "GET", 200, [(b"content-type", b"text/plain")] + [(b"content-range", b"bytes 0-9/100")]
+    )
+    assert not utils.compressible_response(
+        "GET", 200, [(b"content-type", b"text/plain"), (b"content-encoding", b"br")]
+    )
+    assert not utils.compressible_response("GET", 200, [(b"content-type", b"image/png")])
+
+
+def test_add_vary_extends_and_never_replaces():
+    assert utils.add_vary([]) == [(b"vary", b"Accept-Encoding")]
+    assert utils.add_vary([(b"vary", b"Accept-Language")]) == [
+        (b"vary", b"Accept-Language, Accept-Encoding")
+    ]
+    # Already announced (however it is spelled), or covered by the wildcard.
+    assert utils.add_vary([(b"vary", b"accept-encoding")]) == [(b"vary", b"accept-encoding")]
+    assert utils.add_vary([(b"vary", b"Accept-Language, Accept-Encoding")]) == [
+        (b"vary", b"Accept-Language, Accept-Encoding")
+    ]
+    assert utils.add_vary([(b"vary", b"*")]) == [(b"vary", b"*")]
+    # The header list the application sent is left alone.
+    original = [(b"vary", b"Accept-Language")]
+    utils.add_vary(original)
+    assert original == [(b"vary", b"Accept-Language")]
+
+
 def test_compressor_roundtrip_gzip_and_deflate():
     import gzip
     import zlib

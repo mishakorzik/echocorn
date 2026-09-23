@@ -24,6 +24,7 @@ import pytest
 
 from conftest import (
     H1Reader,
+    H2Client,
     ServerThread,
     WSClient,
     build_request,
@@ -32,7 +33,7 @@ from conftest import (
 from echocorn import websocket as ws
 from echocorn import ServerConfig
 from echocorn.config import ConfigError, load_settings, proxy_target
-from echocorn.proxy import ProxyApp
+from echocorn.proxy import ProxyApp, UpstreamClosed
 from echocorn.server import resolve_app
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -329,6 +330,268 @@ def test_the_upstream_connection_is_reused():
         origin.close()
     assert origin.requests == 3
     assert origin.connections == 1
+
+
+# Header hygiene, retries and the limits of a production proxy
+class _StaleConnection:
+    """A pooled upstream connection that is already gone under the proxy."""
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.writes = 0
+
+    def reusable(self) -> bool:
+        return True
+
+    async def drain(self) -> None:
+        return
+
+    def write(self, data) -> None:
+        self.writes += 1
+        raise UpstreamClosed("the upstream connection is gone")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _TruncatingUpstream:
+    """An origin that dies in the middle of its answer."""
+
+    def __init__(self, head: bytes, partial: bytes) -> None:
+        self.head = head
+        self.partial = partial
+        self._sock = socket.socket()
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(8)
+        self.port = self._sock.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                connection, _ = self._sock.accept()
+            except OSError:
+                return
+            try:
+                connection.recv(65536)
+                connection.sendall(self.head + self.partial)
+            except OSError:
+                pass
+            finally:
+                # A clean FIN: the answer is cut short, not reset.
+                connection.close()
+
+    def close(self) -> None:
+        self._sock.close()
+
+
+def _front_to(port: int, **config) -> "ProxyApp":
+    """A proxy application in front of ``port`` with the given configuration."""
+    settings = {"host": "127.0.0.1", "port": 0, "access_log": False}
+    settings.update(config)
+    return ProxyApp("127.0.0.1", port, ServerConfig(**settings))
+
+
+def _read_until_close(connection: socket.socket) -> bytes:
+    """Read a whole response body, however the server chose to end it."""
+    collected = b""
+    while True:
+        try:
+            data = connection.recv(65536)
+        except (ConnectionResetError, socket.timeout, OSError):
+            return collected
+        if not data:
+            return collected
+        collected += data
+
+
+def _drive(app: ProxyApp, method: str = "GET", target: str = "/", headers=None, body: bytes = b"", prime=None):
+    """Run one request through the proxy application in this process."""
+    raw_path, _, query = target.partition("?")
+    scope = {
+        "type": "http",
+        "method": method,
+        "path": raw_path,
+        "raw_path": raw_path.encode("latin-1"),
+        "query_string": query.encode("latin-1"),
+        "headers": headers if headers is not None else [(b"host", b"localhost")],
+        "http_version": "1.1",
+        "scheme": "http",
+        "client": ("127.0.0.1", 50123),
+        "server": ("127.0.0.1", 8080),
+    }
+    messages = []
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message):
+        messages.append(message)
+
+    async def main():
+        if prime is not None:
+            prime()
+        await app(scope, receive, send)
+
+    asyncio.run(main())
+    return messages
+
+
+def _started(messages):
+    for message in messages:
+        if message["type"] == "http.response.start":
+            return message
+    return None
+
+
+def test_every_upstream_connection_is_an_asyncio_protocol():
+    """The proxy must not fall back on the stream layer, anywhere."""
+    import inspect
+
+    from echocorn import proxy
+
+    assert issubclass(proxy.UpstreamConnection, asyncio.Protocol)
+    source = inspect.getsource(proxy)
+    for banned in ("open_connection", "StreamReader", "StreamWriter", "readuntil", "readexactly"):
+        assert banned not in source
+
+
+def test_the_client_link_headers_are_replaced_not_extended(front):
+    """A client must not be able to write its own address into them."""
+    response = _get(
+        front,
+        "/headers",
+        headers=[
+            ("X-Forwarded-For", "203.0.113.9, 10.0.0.1"),
+            ("X-Real-IP", "203.0.113.9"),
+            ("X-Forwarded-Proto", "https"),
+            ("X-Forwarded-Host", "evil.example"),
+            ("Forwarded", "for=203.0.113.9"),
+        ],
+    )
+    pairs = [(name.lower(), value) for name, value in json.loads(response.body)["headers"]]
+    seen = {name: value for name, value in pairs}
+    assert [value for name, value in pairs if name == "x-forwarded-for"] == ["127.0.0.1"]
+    assert seen["x-real-ip"] == "127.0.0.1"
+    assert seen["x-forwarded-proto"] == "http"
+    assert seen["x-forwarded-host"] == "localhost"
+    assert "forwarded" not in seen
+
+
+def test_a_stale_pooled_connection_is_retried(upstream):
+    """A connection the upstream closed since must not become a 502."""
+    application = _front_to(upstream.port)
+    stale = _StaleConnection()
+
+    def prime():
+        application._idle.append((stale, asyncio.get_running_loop().time()))
+
+    messages = _drive(application, prime=prime)
+    assert stale.writes == 1
+    assert stale.closed is True
+    assert _started(messages)["status"] == 200
+    body = b"".join(m["body"] for m in messages if m["type"] == "http.response.body")
+    assert body == b"Hello, World!"
+
+
+def test_a_request_with_a_body_is_never_sent_twice(upstream):
+    """Its body is already gone: the failure is reported, not retried."""
+    application = _front_to(upstream.port)
+    stale = _StaleConnection()
+
+    def prime():
+        application._idle.append((stale, asyncio.get_running_loop().time()))
+
+    messages = _drive(
+        application,
+        method="POST",
+        target="/echo",
+        headers=[(b"host", b"localhost"), (b"content-length", b"3")],
+        body=b"abc",
+        prime=prime,
+    )
+    assert stale.writes == 1
+    assert _started(messages)["status"] == 502
+
+
+def test_an_answer_over_max_response_size_is_refused(upstream):
+    application = _front_to(upstream.port, max_response_size=1024)
+    with ServerThread(application, access_log=False) as front:
+        refused = _get(front, "/compressible")
+        assert refused.status == 502
+        assert b"max_response_size" in refused.body
+        assert _get(front).status == 200
+
+
+def test_a_streamed_answer_over_max_response_size_is_not_terminated():
+    """A cut body must not be framed as though it were whole."""
+    origin = _TruncatingUpstream(
+        b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n",
+        b"5\r\nhello\r\n",
+    )
+    application = _front_to(origin.port)
+    try:
+        with ServerThread(application, access_log=False) as front:
+            connection = front.connect()
+            try:
+                connection.sendall(build_request(target="/", host="localhost"))
+                raw = _read_until_close(connection)
+            finally:
+                connection.close()
+    finally:
+        origin.close()
+    assert raw.startswith(b"HTTP/1.1 200")
+    assert b"hello" in raw
+    # The chunked body never got its terminator, so a client can tell.
+    assert not raw.endswith(b"0\r\n\r\n")
+
+
+def test_a_truncated_answer_resets_the_h2_stream():
+    """On HTTP/2 the same case is an RST_STREAM, not an END_STREAM."""
+    origin = _TruncatingUpstream(
+        b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n",
+        b"5\r\nhello\r\n",
+    )
+    application = _front_to(origin.port)
+    try:
+        with ServerThread(application, access_log=False) as front:
+            with H2Client(front) as client:
+                stream_id = client.request("/")
+                client._pump(lambda: stream_id in client.resets, timeout=10.0)
+                response = client.responses[stream_id]
+                assert response.status == 200
+                assert response.reset is not None
+    finally:
+        origin.close()
+
+
+def test_trailers_are_relayed(front):
+    connection = front.connect()
+    try:
+        connection.sendall(build_request(target="/trailers", host="localhost"))
+        response = read_response(connection)
+    finally:
+        connection.close()
+    assert response.status == 200
+    assert response.body == b"body"
+    # The trailer section announced by the upstream reaches the client whole.
+    assert response.header(b"trailer") == b"x-checksum"
+    assert b"x-checksum: abc123" in response.raw
+    assert response.raw.endswith(b"0\r\nx-checksum: abc123\r\n\r\n")
+
+
+def test_trailers_are_relayed_over_http2(front):
+    client = H2Client(front)
+    try:
+        stream_id = client.request("/trailers")
+        response = client.wait(stream_id)
+    finally:
+        client.close()
+    assert response.status == 200
+    assert bytes(response.body) == b"body"
+    assert (b"x-checksum", b"abc123") in response.trailers
 
 
 # Configuration

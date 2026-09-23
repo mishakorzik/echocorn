@@ -11,9 +11,9 @@ import socket
 import ssl
 import sys
 import time
+from collections.abc import Callable
 from multiprocessing import Process
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
 
 try:
     import uvloop
@@ -24,6 +24,7 @@ from . import utils
 from .config import ConfigError, ServerConfig, load_settings, proxy_target
 from .http1 import CONNECTION_PREFACE, HTTP11Handler
 from .proxy import ProxyApp
+from .ratelimit import RateLimiter, SharedCounters
 from .redirect import RedirectProtocol
 
 # hyper-h2 is an optional dependency: without it the server speaks HTTP/1.1
@@ -70,9 +71,11 @@ SIGNALS = (signal.SIGINT, signal.SIGTERM)
 if hasattr(signal, "SIGBREAK"):
     SIGNALS += (signal.SIGBREAK,)
 
-#: The one line format the server uses.  Only the level token and the
+#: The one line format the server uses. Only the level token and the
 #: timestamp are ever colourised, so the readable part of a line does not
-#: change when colour is switched on for a terminal.
+#: change when colour is switched on for a terminal. The escape has to sit
+#: outside the brackets for that to hold: it is written around the whole
+#: ``[LEVEL]``, never in the middle of it, so ``[INFO ]`` stays on the line.
 LOG_FORMAT = "%(asctime)s [%(levelname)-5s] %(process)7d: %(message)s"
 LOG_COLOR_FORMAT = "\033[90m%(asctime)s \033[0m[%(levelcolor)s%(levelname)-5s\033[0m] %(process)7d: %(message)s"
 
@@ -123,13 +126,13 @@ def format_address(sock: socket.socket) -> str:
     return "%s:%d" % (host, port)
 
 
-async def _watch_supervisor(stop_event: Any, supervisor: Optional[Callable[[], bool]], stop: asyncio.Event) -> None:
+async def _watch_supervisor(stop_event: object, supervisor: Callable[[], bool] | None, stop: asyncio.Event) -> None:
     """
     Stop a worker when its supervisor asks - or disappears.
 
     A ``multiprocessing.Event`` cannot be awaited and a dead parent cannot be
     signalled, so both are polled: one cheap timer per worker, and only when
-    the server was started by a supervisor.  Watching the parent too is what
+    the server was started by a supervisor. Watching the parent too is what
     keeps a killed master from leaving workers behind.
     """
     while True:
@@ -142,7 +145,7 @@ async def _watch_supervisor(stop_event: Any, supervisor: Optional[Callable[[], b
     stop.set()
 
 
-def _worker_supervisor() -> Optional[Callable[[], bool]]:
+def _worker_supervisor() -> Callable[[], bool] | None:
     """A liveness check for the process that started this worker, if any."""
     parent = multiprocessing.parent_process()
     if parent is None:
@@ -166,7 +169,7 @@ def resolve_app(value: str, config: ServerConfig) -> Callable:
     return ProxyApp(target[0], target[1], config)
 
 
-async def _redirect_only_app(scope: Any, receive: Any, send: Any) -> None:  # pragma: no cover - never called
+async def _redirect_only_app(scope: object, receive: object, send: object) -> None:  # pragma: no cover - never called
     """Placeholder of the worker that serves only the HTTP to HTTPS redirect."""
     raise RuntimeError("this worker serves the redirect, not the application")
 
@@ -198,22 +201,23 @@ class ConnectionProtocol(asyncio.Protocol):
     else is treated as HTTP/1.1.
     """
 
-    def __init__(self, app: Callable, config: ServerConfig, connections: Set["ConnectionProtocol"], logger_: logging.Logger, on_release: Optional[Callable[[], None]] = None) -> None:
+    def __init__(self, app: Callable, config: ServerConfig, connections: set["ConnectionProtocol"], logger_: logging.Logger, on_release: Callable[[], None] | None = None, rate_limiter: RateLimiter | None = None) -> None:
         self.app = app
         self.config = config
         self.logger = logger_
         self._connections = connections
         self._on_release = on_release
+        self.rate_limiter = rate_limiter
         self._released = False
         self._connections.add(self)
-        self.transport: Optional[asyncio.Transport] = None
-        self.peername: Any = None
-        self.server_addr: Any = None
-        self.ssl_object: Any = None
-        self._handler: Any = None
-        self._pending: Optional[bytearray] = None
+        self.transport: asyncio.Transport | None = None
+        self.peername: object = None
+        self.server_addr: object = None
+        self.ssl_object: object = None
+        self._handler: object = None
+        self._pending: bytearray | None = None
         self._mode = "h1"
-        self._decision_timer: Optional[asyncio.TimerHandle] = None
+        self._decision_timer: asyncio.TimerHandle | None = None
         self._closed = False
 
     # lifecycle
@@ -235,7 +239,6 @@ class ConnectionProtocol(asyncio.Protocol):
             return
 
         if self.ssl_object is not None:
-            alpn = None
             try:
                 alpn = self.ssl_object.selected_alpn_protocol()
             except Exception:
@@ -278,6 +281,7 @@ class ConnectionProtocol(asyncio.Protocol):
             self.ssl_object,
             self.logger,
             on_close=self._release,
+            rate_limiter=self.rate_limiter,
         )
         self._handler.connection_made()
 
@@ -297,6 +301,7 @@ class ConnectionProtocol(asyncio.Protocol):
             self.ssl_object,
             self.logger,
             on_close=self._release,
+            rate_limiter=self.rate_limiter,
         )
         self._handler.connection_made()
 
@@ -322,7 +327,7 @@ class ConnectionProtocol(asyncio.Protocol):
         self._release()
 
     @staticmethod
-    def _tune_socket(sock: Any) -> None:
+    def _tune_socket(sock: object) -> None:
         """Latency and liveness options for an accepted socket."""
         utils.tune_socket(sock)
 
@@ -392,6 +397,11 @@ class ConnectionProtocol(asyncio.Protocol):
 
     # data
     def data_received(self, data: bytes) -> None:
+        if self._closed:
+            # A connection that was refused (over the limit, or speaking a
+            # protocol this server does not serve) is gone; bytes that were
+            # already in flight must not reach an application.
+            return
         if self._handler is not None:
             self._handler.data_received(data)
             return
@@ -403,13 +413,17 @@ class ConnectionProtocol(asyncio.Protocol):
         if not self._decide_cleartext():
             return
         self._cancel_decision_timer()
-        pending = bytes(self._pending)
+        # The buffer is handed over as it is, so the first request of a
+        # connection is not copied a second time; hyper-h2 is the one caller
+        # that wants ``bytes``.
+        pending: object = self._pending
         self._pending = None
         if self._mode == "h2":
             self._install_http2()
+            self._handler.data_received(bytes(pending))
         else:
             self._install_http1()
-        self._handler.data_received(pending)
+            self._handler.data_received(pending)
 
     def _decide_cleartext(self) -> bool:
         buffer = self._pending
@@ -417,15 +431,16 @@ class ConnectionProtocol(asyncio.Protocol):
         if len(buffer) >= len(CONNECTION_PREFACE):
             self._mode = "h2" if buffer.startswith(CONNECTION_PREFACE) else "h1"
             return True
-        if not CONNECTION_PREFACE.startswith(bytes(buffer)):
+        if not CONNECTION_PREFACE.startswith(buffer):
             # Cannot possibly become the HTTP/2 preface any more.
             self._mode = "h1"
             return True
-        if b"\r\n\r\n" in buffer:
-            self._mode = "h1"
-            return True
-        # Every other byte sequence either already diverged from the preface or
-        # is still a prefix of it, so waiting for more input is always correct.
+        # Everything else is a strict prefix of the preface, so waiting for
+        # more input is always correct - including the prefixes that happen to
+        # contain a CRLFCRLF ("PRI * HTTP/2.0\r\n\r\n" is 18 bytes of the 24).
+        # Deciding "HTTP/1.1" on those would break an h2c connection whose
+        # preface the network split into two segments, which is a real thing
+        # that happens on a WAN (and the decision timer bounds the wait).
         return False
 
     # asyncio callbacks
@@ -443,7 +458,7 @@ class ConnectionProtocol(asyncio.Protocol):
         if self._handler is not None:
             self._handler.resume_writing()
 
-    def connection_lost(self, exc: Optional[BaseException]) -> None:
+    def connection_lost(self, exc: BaseException | None) -> None:
         self._closed = True
         self._cancel_decision_timer()
         if self._handler is not None:
@@ -464,31 +479,27 @@ class ConnectionProtocol(asyncio.Protocol):
 
 
 # Lifespan
-async def run_lifespan(app: Callable, timeout: float = 10.0) -> Any:
+async def run_lifespan(app: Callable, timeout: float = 10.0) -> object:
     """Drive the ASGI lifespan protocol and return a context with ``shutdown``."""
     receive_queue: asyncio.Queue = asyncio.Queue()
     started = asyncio.Event()
     stopped = asyncio.Event()
-    failure: Dict[str, Optional[BaseException]] = {"error": None}
+    failure: dict[str, BaseException | None] = {"error": None}
 
-    async def receive() -> Dict[str, Any]:
+    async def receive() -> dict[str, object]:
         return await receive_queue.get()
 
-    async def send(message: Dict[str, Any]) -> None:
+    async def send(message: dict[str, object]) -> None:
         message_type = message.get("type")
         if message_type == "lifespan.startup.complete":
             started.set()
         elif message_type == "lifespan.startup.failed":
-            failure["error"] = RuntimeError(
-                "lifespan.startup.failed: %s" % (message.get("message"),)
-            )
+            failure["error"] = RuntimeError("lifespan.startup.failed: %s" % (message.get("message"),))
             started.set()
         elif message_type == "lifespan.shutdown.complete":
             stopped.set()
         elif message_type == "lifespan.shutdown.failed":
-            failure["error"] = RuntimeError(
-                "lifespan.shutdown.failed: %s" % (message.get("message"),)
-            )
+            failure["error"] = RuntimeError("lifespan.shutdown.failed: %s" % (message.get("message"),))
             stopped.set()
 
     task = asyncio.ensure_future(app({"type": "lifespan"}, receive, send))
@@ -500,11 +511,7 @@ async def run_lifespan(app: Callable, timeout: float = 10.0) -> Any:
     waiter = asyncio.ensure_future(started.wait())
     supported = True
     try:
-        await asyncio.wait(
-            {waiter, task},
-            timeout=timeout,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+        await asyncio.wait({waiter, task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
     except asyncio.CancelledError:
         waiter.cancel()
         task.cancel()
@@ -531,14 +538,9 @@ async def run_lifespan(app: Callable, timeout: float = 10.0) -> Any:
                 if supported and not task.done():
                     receive_queue.put_nowait({"type": "lifespan.shutdown"})
                     try:
-                        await asyncio.wait_for(
-                            stopped.wait(), timeout=shutdown_timeout
-                        )
+                        await asyncio.wait_for(stopped.wait(), timeout=shutdown_timeout)
                     except asyncio.TimeoutError:
-                        logger.warning(
-                            "Lifespan shutdown did not complete within %.1fs",
-                            shutdown_timeout,
-                        )
+                        logger.warning("Lifespan shutdown did not complete within %.1fs", shutdown_timeout,)
             finally:
                 if not task.done():
                     task.cancel()
@@ -558,9 +560,15 @@ class ASGIServer:
     ``ASGIServer(app, config)`` is the modern form; keyword arguments matching
     :class:`~echocorn.config.ServerConfig` fields are still accepted for
     backwards compatibility with the 1.0 API.
+
+    ``shared_counters`` is the rate limit table every worker of this server
+    counts into; ``None`` with a configuration that asks for sharing means this
+    process creates one for itself (which is what an embedded server does), and
+    ``create_shared = False`` refuses even that, for a worker whose master's
+    table could not be mapped.
     """
 
-    def __init__(self, app: Callable, config: Optional[ServerConfig] = None, **overrides: Any) -> None:
+    def __init__(self, app: Callable, config: ServerConfig | None = None, shared_counters: SharedCounters | None = None, create_shared: bool = True, **overrides: object) -> None:
         self.app = app
         self.config = config if config is not None else ServerConfig()
         self.config.app = app
@@ -570,16 +578,27 @@ class ASGIServer:
             setattr(self.config, key, value)
         self.logger = logger
         self.ssl_context = self._create_ssl_context()
-        self._connections: Set[ConnectionProtocol] = set()
-        self._server: Optional[asyncio.AbstractServer] = None
+        if (shared_counters is None and create_shared and self.config.ratelimit_enabled and self.config.workers > 1):
+            shared_counters = _open_shared_counters(self.config)
+        if shared_counters is not None and not shared_counters.start():
+            # The memory cannot be mapped in this process: count in it instead
+            # of failing, and say so once.
+            logger.warning("The shared rate limit table could not be mapped; this worker counts on its own")
+            shared_counters = None
+        self.shared_counters = shared_counters
+        #: Rate limiting state for this worker, shared by every connection it
+        #: accepts. ``None`` when the configuration turns it off.
+        self.rate_limiter = RateLimiter.from_config(self.config, shared_counters)
+        self._connections: set[ConnectionProtocol] = set()
+        self._server: asyncio.AbstractServer | None = None
         #: The plaintext listener that redirects to HTTPS, when it is enabled.
-        self._redirect_server: Optional[asyncio.AbstractServer] = None
-        self._stop_event: Optional[asyncio.Event] = None
+        self._redirect_server: asyncio.AbstractServer | None = None
+        self._stop_event: asyncio.Event | None = None
         #: Set when a connection is released; created on the serving loop.
         self._released = asyncio.Event()
 
     # TLS
-    def _create_ssl_context(self) -> Optional[ssl.SSLContext]:
+    def _create_ssl_context(self) -> ssl.SSLContext | None:
         if not self.config.certfile or not self.config.keyfile:
             return None
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -595,7 +614,7 @@ class ASGIServer:
             context.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20")
         except ssl.SSLError:
             self.logger.warning("Could not restrict the cipher suite list")
-        protocols: List[str] = []
+        protocols: list[str] = []
         if self.config.http2_enabled and H2_AVAILABLE:
             protocols.append("h2")
         if self.config.http1_enabled:
@@ -605,7 +624,7 @@ class ASGIServer:
         return context
 
     # sockets
-    def create_listen_socket(self, host: Optional[str] = None, port: Optional[int] = None, reuse_port: Optional[bool] = None) -> socket.socket:
+    def create_listen_socket(self, host: str | None = None, port: int | None = None, reuse_port: bool | None = None) -> socket.socket:
         """
         Bind and listen on ``host``/``port``.
 
@@ -645,18 +664,31 @@ class ASGIServer:
         return sock
 
     @property
-    def redirect_address(self) -> Any:
+    def redirect_address(self) -> object:
         """The bound address of the redirect listener, or ``None``."""
         server = self._redirect_server
         if server is None or not server.sockets:
             return None
         return server.sockets[0].getsockname()
 
+    def close_rate_limiter(self) -> None:
+        """
+        Give up the rate limit counters.
+
+        A table this process created is removed here, so a server that starts
+        and stops leaves nothing behind in shared memory; a table it only
+        mapped is unmapped, and the process that created it removes it.
+        """
+        limiter, self.rate_limiter = self.rate_limiter, None
+        if limiter is not None:
+            limiter.close()
+        self.shared_counters = None
+
     # serving
     def _make_protocol(self) -> ConnectionProtocol:
-        return ConnectionProtocol(self.app, self.config, self._connections, logging.getLogger("echocorn"), on_release=self._released.set)
+        return ConnectionProtocol(self.app, self.config, self._connections, logging.getLogger("echocorn"), on_release=self._released.set, rate_limiter=self.rate_limiter)
 
-    async def _create_redirect_server(self, loop: asyncio.AbstractEventLoop, app_sock: Optional[socket.socket] = None) -> asyncio.AbstractServer:
+    async def _create_redirect_server(self, loop: asyncio.AbstractEventLoop, app_sock: socket.socket | None = None) -> asyncio.AbstractServer:
         """
         Open the plaintext listener that redirects every request to HTTPS.
 
@@ -684,6 +716,7 @@ class ASGIServer:
                 logging.getLogger("echocorn"),
                 https_port=https_port,
                 on_release=self._released.set,
+                rate_limiter=self.rate_limiter,
             )
 
         try:
@@ -692,7 +725,7 @@ class ASGIServer:
             sock.close()
             raise
 
-    def run(self, sock: Optional[socket.socket] = None) -> None:
+    def run(self, sock: socket.socket | None = None) -> None:
         """Blocking helper: run the server on a fresh event loop."""
         _run(self.serve(sock))
 
@@ -710,12 +743,12 @@ class ASGIServer:
         """Ask a running server to shut down (coroutine friendly alias)."""
         self.request_stop()
 
-    async def serve(self, sock: Optional[socket.socket] = None, *, announce: bool = True, on_ready: Optional[Callable[[], None]] = None, stop_event: Any = None, supervisor: Optional[Callable[[], bool]] = None, redirect: bool = True, redirect_only: bool = False) -> None:
+    async def serve(self, sock: socket.socket | None = None, *, announce: bool = True, on_ready: Callable[[], None] | None = None, stop_event: object = None, supervisor: Callable[[], bool] | None = None, redirect: bool = True, redirect_only: bool = False) -> None:
         """
         Start accepting connections until a signal asks the server to stop.
 
         ``sock`` may be supplied by the caller (useful for tests and for
-        inheriting a socket from a supervisor process).  ``on_ready`` runs as
+        inheriting a socket from a supervisor process). ``on_ready`` runs as
         soon as the listening socket is bound, which is how a worker announces
         itself; ``stop_event`` (a ``multiprocessing.Event``) lets the process
         that started this one request the same graceful stop, and
@@ -739,7 +772,7 @@ class ASGIServer:
         # but never accepts on it.
         self._server = None
         if not redirect_only:
-            create_kwargs: Dict[str, Any] = {"sock": sock, "ssl": self.ssl_context}
+            create_kwargs: dict[str, object] = {"sock": sock, "ssl": self.ssl_context}
             if self.ssl_context is not None and self.config.request_timeout > 0:
                 # The single request deadline also bounds the TLS handshake,
                 # which happens before the application ever sees the connection.
@@ -761,6 +794,7 @@ class ASGIServer:
                     await self._server.wait_closed()
                 except Exception:
                     pass
+                self.close_rate_limiter()
                 raise
 
         stop = asyncio.Event()
@@ -792,7 +826,7 @@ class ASGIServer:
                 # reachable, because that is the line the operator looks for.
                 banner.info("Serving %s on %s", scheme, format_address(sock))
 
-        watcher: Optional[asyncio.Task] = None
+        watcher: asyncio.Task | None = None
         if stop_event is not None or supervisor is not None:
             watcher = asyncio.ensure_future(_watch_supervisor(stop_event, supervisor, stop))
         try:
@@ -828,7 +862,7 @@ class ASGIServer:
                 # the server still stops through request_stop().
                 pass
 
-    async def _shutdown(self, lifespan: Any) -> None:
+    async def _shutdown(self, lifespan: object) -> None:
         banner.info("Shutting down")
         loop = asyncio.get_running_loop()
         server = self._server
@@ -884,6 +918,8 @@ class ASGIServer:
             except asyncio.TimeoutError:
                 pass
 
+        self.close_rate_limiter()
+
         if lifespan is not None:
             try:
                 await lifespan.shutdown(self.config.graceful_timeout)
@@ -899,7 +935,7 @@ def _new_event_loop() -> asyncio.AbstractEventLoop:
     return asyncio.new_event_loop()
 
 
-def _run(coro: Any) -> Any:
+def _run(coro: object) -> object:
     """Run ``coro`` to completion on a fresh loop (uvloop when available)."""
     if hasattr(asyncio, "Runner"):
         with asyncio.Runner(loop_factory=_new_event_loop) as runner:
@@ -950,7 +986,7 @@ def _configure_logging(level: str, color: bool = False) -> None:
     banner.setLevel(logging.INFO)
 
 
-def _add_import_path(config_path: Any) -> None:
+def _add_import_path(config_path: object) -> None:
     """Let ``app = "app:app"`` find a module next to the configuration file."""
     directory = str(Path(config_path).parent.resolve())
     if directory not in sys.path:
@@ -976,7 +1012,7 @@ class WorkerGroup:
 
     The process that reads the configuration is worker #1 and serves traffic
     itself, so ``WorkerGroup(4)`` starts three more processes that bind the same
-    port with ``SO_REUSEPORT``.  Each child reports back once its socket is
+    port with ``SO_REUSEPORT``. Each child reports back once its socket is
     bound, which is what makes the startup output predictable::
 
         Waiting for all workers (4)
@@ -989,24 +1025,29 @@ class WorkerGroup:
 
     def __init__(self, count: int) -> None:
         self.count = count
-        self.children: List[Process] = []
+        self.children: list[Process] = []
         self.stop_event = multiprocessing.Event()
-        self._ready: Any = multiprocessing.SimpleQueue()
+        self._ready: object = multiprocessing.SimpleQueue()
 
-    def start(self, config_path: Path, sock: socket.socket) -> None:
+    def start(self, config_path: Path, sock: socket.socket, shared: SharedCounters | None = None) -> None:
         """
         Announce the startup, spawn the children and wait for each one.
 
         The listening socket is created here, once, and handed to every child:
         they all accept on the same port without binding it again, which is
         what makes ``workers`` work on platforms without ``SO_REUSEPORT``.
+        ``shared`` is the rate limit table the master created: its name and its
+        mutexes are handed over as well, so every worker counts into the same
+        memory instead of one table per process.
         """
         banner.info("Waiting for all workers (%d)", self.count)
         banner.info("Worker #1 ready (current)")
+        name = shared.name if shared is not None else None
+        locks = list(shared.locks) if shared is not None else None
         for index in range(2, self.count + 1):
             process = Process(
                 target=_worker_entry,
-                args=(str(config_path), index, self._ready, self.stop_event, sock),
+                args=(str(config_path), index, self._ready, self.stop_event, sock, name, locks),
                 name="echocorn-worker-%d" % index,
             )
             process.start()
@@ -1059,12 +1100,19 @@ class WorkerGroup:
                 process.join(timeout=5.0)
 
 
-def _start_server(settings: Any, *, worker_index: int = 1, ready: Any = None, stop_event: Any = None, group: Optional[WorkerGroup] = None, sock: Optional[socket.socket] = None, supervisor: Optional[Callable[[], bool]] = None) -> None:
+def _start_server(settings: object, *, worker_index: int = 1, ready: object = None, stop_event: object = None, group: WorkerGroup | None = None, sock: socket.socket | None = None, supervisor: Callable[[], bool] | None = None, shared: SharedCounters | None = None, create_shared: bool = True) -> None:
     """Build the application and serve it until it is stopped."""
     # The redirect is served by a worker of its own, which only pays off when
-    # another worker is left to serve the application.  With a single process
+    # another worker is left to serve the application. With a single process
     # there is no worker to spare, so the redirect stays off (main() warns).
     redirect = worker_index == 1 and group is not None and settings.config.redirect_enabled
+
+    if (shared is None and worker_index == 1 and settings.config.ratelimit_enabled and settings.config.workers > 1):
+        # The process that reads the configuration is worker #1 and starts the
+        # others, so it is the one that creates the table they all count into.
+        # Creating it before the workers exist is what makes the allowance one
+        # set of counters from the very first request.
+        shared = _open_shared_counters(settings.config)
 
     app: Callable
     if redirect:
@@ -1078,7 +1126,7 @@ def _start_server(settings: Any, *, worker_index: int = 1, ready: Any = None, st
             logger.exception("Could not create the application %r", settings.app)
             raise SystemExit(1) from None
 
-    server = ASGIServer(app, settings.config)
+    server = ASGIServer(app, settings.config, shared_counters=shared, create_shared=create_shared)
     owns_socket = False
     if sock is None and group is not None:
         # The master binds once; the workers inherit the socket.
@@ -1092,7 +1140,15 @@ def _start_server(settings: Any, *, worker_index: int = 1, ready: Any = None, st
     def on_ready() -> None:
         """Runs on the serving loop, once the listening socket is bound."""
         if group is not None and sock is not None:
-            group.start(settings.path, sock)
+            group.start(settings.path, sock, shared=shared)
+            counters = server.shared_counters
+            if counters is not None:
+                banner.info(
+                    "Rate limiting is shared by all %d workers (%d client slots, %d shards)",
+                    settings.config.workers,
+                    counters.slots,
+                    counters.shards,
+                )
         if ready is not None:
             banner.info("Worker #%d ready", worker_index)
             ready.put(worker_index)
@@ -1128,8 +1184,31 @@ def _start_server(settings: Any, *, worker_index: int = 1, ready: Any = None, st
                 pass
 
 
-def _worker_entry(config_path: str, index: int, ready: Any, stop_event: Any, sock: Optional[socket.socket] = None) -> None:
-    """Run one worker process from the same configuration file."""
+def _open_shared_counters(config: ServerConfig) -> SharedCounters | None:
+    """
+    Create the one rate limit table this server's workers count into.
+
+    Shared memory rather than a file or a second process: a decision is one
+    mutex and one slot, with no syscall, no disk and nothing to keep in sync
+    behind the request.  Failing to create it is not worth refusing to serve -
+    the workers then count on their own, which is what a single process does
+    anyway, and the log says so.
+    """
+    try:
+        return SharedCounters.create(config)
+    except Exception as exc:
+        logger.warning("Rate limit counters cannot be shared (%s); every worker will keep its own", exc)
+        return None
+
+
+def _worker_entry(config_path: str, index: int, ready: object, stop_event: object, sock: socket.socket | None = None, shared_name: str | None = None, shard_locks: list[object] | None = None) -> None:
+    """
+    Run one worker process from the same configuration file.
+
+    ``shared_name``/``shard_locks`` are the rate limit table the master created
+    before this process was started: every worker maps the same memory, so the
+    allowance is one set of counters for the whole server.
+    """
     try:
         settings = load_settings(config_path)
     except ConfigError as exc:
@@ -1137,6 +1216,16 @@ def _worker_entry(config_path: str, index: int, ready: Any, stop_event: Any, soc
         raise SystemExit(1) from None
     _configure_logging(settings.config.log_level, settings.config.log_color)
     _add_import_path(settings.path)
+
+    shared: SharedCounters | None = None
+    if shared_name is not None:
+        try:
+            shared = SharedCounters.attach(shared_name, shard_locks or [], settings.config)
+        except Exception:
+            # A worker that cannot map the counters counts on its own rather
+            # than refusing to serve: the server stays up, the limit is per
+            # process, and the log says so.
+            logger.exception("Could not map the shared rate limit counters")
     try:
         _start_server(
             settings,
@@ -1145,6 +1234,10 @@ def _worker_entry(config_path: str, index: int, ready: Any, stop_event: Any, soc
             stop_event=stop_event,
             sock=sock,
             supervisor=_worker_supervisor(),
+            shared=shared,
+            # A table of its own is not a substitute for the one the master
+            # created: this worker counts on its own instead of pretending.
+            create_shared=shared_name is None,
         )
     except SystemExit:
         pass
@@ -1169,9 +1262,9 @@ Options:
 """
 
 
-def _config_argument(arguments: List[str]) -> Optional[str]:
+def _config_argument(arguments: list[str]) -> str | None:
     """Return the ``--config`` path, or report the problem and return None."""
-    path: Optional[str] = None
+    path: str | None = None
     index = 0
     while index < len(arguments):
         argument = arguments[index]
@@ -1196,7 +1289,7 @@ def _config_argument(arguments: List[str]) -> Optional[str]:
     return path
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     """Entry point for the ``echocorn`` command and ``python -m echocorn``."""
     arguments = list(sys.argv[1:] if argv is None else argv)
 
@@ -1229,7 +1322,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     banner.info("Using '%s' as event loop", "uvloop" if uvloop is not None else "asyncio")
     logger.debug(
         "Settings: host=%r, port=%d, workers=%d, http1=%s, http2=%s, websocket=%s, "
-        "compression=%s, safe_headers=%s, tls=%s, redirect=%s, app=%s",
+        "compression=%s, safe_headers=%s, ratelimit=%s, tls=%s, redirect=%s, app=%s",
         settings.config.host,
         settings.config.port,
         settings.config.workers,
@@ -1238,6 +1331,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         settings.config.websockets,
         settings.config.compression,
         settings.config.safe_headers,
+        settings.config.ratelimit_enabled,
         bool(settings.config.certfile),
         settings.config.redirect_enabled,
         settings.app,

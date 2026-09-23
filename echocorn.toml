@@ -12,6 +12,13 @@
 # all stay in front, and WebSocket sessions are tunnelled through). Only a
 # loopback, private or link-local address is accepted, so a configuration file
 # can never turn the server into an open proxy.
+#
+# The upstream sees the address the connection actually came from in
+# X-Forwarded-For, X-Real-IP, X-Forwarded-Proto/Host/Port: the values a client
+# sent are replaced, never appended to, so the application cannot be lied to.
+# A keep-alive connection the upstream closed since is retried once on a fresh
+# one (idempotent requests without a body), and an answer that dies halfway is
+# cut rather than framed as if it were complete.
 app = "app:app"
 
 
@@ -40,6 +47,7 @@ graceful_timeout = 10.0
 max_connections = 0
 backlog = 2048
 max_request_size = 0
+max_response_size = 0
 max_header_size = 16384
 max_header_count = 128
 
@@ -73,10 +81,52 @@ max_header_list_size = 16384
 [websocket]
 # Accept WebSocket upgrades over HTTP/1.1. wss:// is served
 # whenever TLS is configured.
-enabled = true
+enabled = false
 
 # Biggest message accepted, counting all of its fragments.
 max_message_size = 4194304
+
+
+[ratelimit]
+# enabled - switch the whole section on. With it off nothing else here is read.
+enabled = false
+
+# requests - how many requests one client may make in any 'window' seconds.
+requests = 10
+
+# peak - how far one single burst inside a window may go. Handed out once per
+# window, so it is a spike and never a second allowance. 0 means no burst.
+peak = 12
+
+# window - length of the sliding window the two numbers above are counted over,
+# in seconds. It slides, so the end of one window and the start of the next
+# cannot be used twice.
+window = 7.0
+
+# ban - how long a client that went past the burst is refused, in seconds, and
+# what it is told in Retry-After. Those refusals are not counted, so the client
+# starts clean afterwards. 0 only holds it back until the window has room again.
+ban = 60.0
+
+# shards - mutexes the table is spread over. Not a limit: a request holds the
+# mutex of its client's shard, and 64 is where several workers stop colliding.
+shards = 64
+
+# cache_size - megabytes of client counters for the whole server, not per
+# worker. One client costs 46 bytes plus eight per request of the allowance, so
+# 128 MB is about 894 000 addresses at the default peak of 12, and fewer of a
+# larger one. A full table does not refuse anybody: that request is counted in
+# the worker that could not place it and stats["overflow"] grows.
+#
+# There is no file and no database behind any of this. The process that reads
+# this file creates one segment of shared memory and the mutexes before it
+# starts the workers, every worker maps the same bytes, and all of them read and
+# write the same slots - so workers = 4 does not allow four times as much, and
+# no worker holds a copy that can fall behind. A decision takes one mutex and
+# touches one slot: no disk, no syscall, no second process. A worker that dies
+# holding a mutex cannot block the rest (the acquire is bounded), and one that
+# finds every slot of its probe taken counts the request itself instead.
+cache_size = 128
 
 
 [redirect]
