@@ -54,12 +54,12 @@ safe_headers = false
 
 
 [http1]
-# Serve HTTP/1.1 (RFC 9110, RFC 9112).
+# Serve HTTP/1.1
 enabled = true
 
 
 [http2]
-# Serve HTTP/2 (RFC 9113) over TLS with ALPN, or "h2c" with prior knowledge.
+# Serve HTTP/2over TLS with ALPN, or "h2c" with prior knowledge.
 # Nothing is advertised through ALPN while this is false.
 enabled = true
 
@@ -71,7 +71,7 @@ max_header_list_size = 16384
 
 
 [websocket]
-# Accept WebSocket upgrades (RFC 6455) over HTTP/1.1. wss:// is served
+# Accept WebSocket upgrades over HTTP/1.1. wss:// is served
 # whenever TLS is configured.
 enabled = true
 
