@@ -25,11 +25,11 @@ app = "app:app"
 [server]
 # Where to listen. An empty host binds every interface.
 host = "0.0.0.0"
-port = 443
+port = 8000
 
 # Worker processes sharing the port. This process is worker #1 and the other
 # workers - 1 are started as child processes.
-workers = 2
+workers = 1
 
 # One timeout guards a request in every phase: the TLS handshake, receiving the
 # head and body (absolute, so trickling does not extend it), then producing the
@@ -81,7 +81,7 @@ max_header_list_size = 16384
 [websocket]
 # Accept WebSocket upgrades over HTTP/1.1. wss:// is served
 # whenever TLS is configured.
-enabled = false
+enabled = true
 
 # Biggest message accepted, counting all of its fragments.
 max_message_size = 4194304
